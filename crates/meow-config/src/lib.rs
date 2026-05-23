@@ -318,14 +318,14 @@ fn rebuild_from_raw_impl(
     // Parse sub-rules before top-level rules so that SUB-RULE entries in
     // `rules:` can resolve against already-built blocks.
     let sub_rules = match raw.sub_rules.as_ref() {
-        Some(map) if !map.is_empty() => sub_rules_parser::parse_sub_rules(map, &ruleset_map, &ctx)?,
+        Some(map) if !map.is_empty() => sub_rules_parser::parse_sub_rules(map, &ruleset_map, ctx)?,
         _ => HashMap::new(),
     };
 
     let rules = rule_parser::parse_rules_full(
         raw.rules.as_deref().unwrap_or(&[]),
         &ruleset_map,
-        &ctx,
+        ctx,
         &sub_rules,
     );
 

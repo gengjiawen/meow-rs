@@ -1,7 +1,6 @@
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
-
-use regex::RegexSet;
 
 pub struct DomainTrie<T: Clone + 'static> {
     entries: Mutex<Vec<Entry<T>>>,
@@ -22,41 +21,25 @@ enum MatchKind {
     Dot,
 }
 
-impl MatchKind {
-    fn priority(self) -> u8 {
-        match self {
-            Self::Exact => 0,
-            Self::Star => 1,
-            Self::Dot => 2,
-        }
-    }
-
-    fn to_regex(self, domain: &str) -> String {
-        let escaped = regex::escape(domain);
-        match self {
-            Self::Exact => format!("^{escaped}$"),
-            Self::Star => format!("^[^.]+\\.{escaped}$"),
-            Self::Dot => format!("^.+\\.{escaped}$"),
-        }
-    }
-}
-
 enum Compiled<T> {
     Empty,
-    /// For large `DomainTrie<()>` sets (geosite): Bloom-filter matching.
-    /// FPR ~0.1% — a false positive causes one domain to hit the wrong
-    /// proxy group, which is harmless (the connection fails or retries).
+    /// ZST path: pure Bloom filters (~0.1% FPR). Filter size is dynamic,
+    /// computed as `n * 14.4` bits for `n` items to guarantee <0.1% FPR.
     BloomCheck {
         exact: BloomFilter,
         star: BloomFilter,
         dot: BloomFilter,
         value: T,
     },
-    /// For value-mapped tries (small counts): per-entry regex patterns.
-    Individual {
-        set: RegexSet,
-        values: Vec<T>,
-        priorities: Vec<u8>,
+    /// Value-bearing path: Bloom filters for fast rejection, HashMaps for
+    /// exact value retrieval on hits (effective FPR = 0%).
+    BloomMap {
+        exact_bloom: BloomFilter,
+        star_bloom: BloomFilter,
+        dot_bloom: BloomFilter,
+        exact: HashMap<String, T>,
+        star: HashMap<String, T>,
+        dot: HashMap<String, T>,
     },
 }
 
@@ -176,22 +159,34 @@ impl<T: Clone + 'static> DomainTrie<T> {
                 }
                 None
             }
-            Compiled::Individual {
-                set,
-                values,
-                priorities,
+            Compiled::BloomMap {
+                exact_bloom,
+                star_bloom,
+                dot_bloom,
+                exact,
+                star,
+                dot,
             } => {
-                let matches = set.matches(query);
-                let mut best: Option<(u8, usize)> = None;
-                for idx in &matches {
-                    let pri = priorities[idx];
-                    match best {
-                        None => best = Some((pri, idx)),
-                        Some((best_pri, _)) if pri < best_pri => best = Some((pri, idx)),
-                        _ => {}
+                if exact_bloom.maybe_contains(query) {
+                    if let Some(v) = exact.get(query) {
+                        return Some(v);
                     }
                 }
-                best.map(|(_, idx)| &values[idx])
+                for (i, _) in query.match_indices('.') {
+                    let suffix = &query[i..];
+                    let prefix = &query[..i];
+                    if !prefix.contains('.') && star_bloom.maybe_contains(suffix) {
+                        if let Some(v) = star.get(suffix) {
+                            return Some(v);
+                        }
+                    }
+                    if dot_bloom.maybe_contains(suffix) {
+                        if let Some(v) = dot.get(suffix) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
             }
         }
     }
@@ -210,29 +205,47 @@ impl<T: Clone + 'static> DomainTrie<T> {
             return Compiled::Empty;
         }
 
-        if std::mem::size_of::<T>() == 0 && entries.len() > 100 {
+        if std::mem::size_of::<T>() == 0 {
             Self::compile_bloom(&entries)
         } else {
-            Self::compile_individual(entries)
+            Self::compile_bloom_map(entries)
         }
     }
 
-    fn compile_individual(entries: Vec<Entry<T>>) -> Compiled<T> {
-        let mut patterns = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
-        let mut priorities = Vec::with_capacity(entries.len());
+    fn compile_bloom_map(entries: Vec<Entry<T>>) -> Compiled<T> {
+        let mut exact_items: Vec<String> = Vec::new();
+        let mut star_items: Vec<String> = Vec::new();
+        let mut dot_items: Vec<String> = Vec::new();
+        let mut exact_map: HashMap<String, T> = HashMap::new();
+        let mut star_map: HashMap<String, T> = HashMap::new();
+        let mut dot_map: HashMap<String, T> = HashMap::new();
 
         for e in entries {
-            patterns.push(e.kind.to_regex(&e.base_domain));
-            values.push(e.value);
-            priorities.push(e.kind.priority());
+            match e.kind {
+                MatchKind::Exact => {
+                    exact_items.push(e.base_domain.clone());
+                    exact_map.entry(e.base_domain).or_insert(e.value);
+                }
+                MatchKind::Star => {
+                    let key = format!(".{}", e.base_domain);
+                    star_items.push(key.clone());
+                    star_map.entry(key).or_insert(e.value);
+                }
+                MatchKind::Dot => {
+                    let key = format!(".{}", e.base_domain);
+                    dot_items.push(key.clone());
+                    dot_map.entry(key).or_insert(e.value);
+                }
+            }
         }
 
-        let set = RegexSet::new(&patterns).expect("compile DomainTrie regex set");
-        Compiled::Individual {
-            set,
-            values,
-            priorities,
+        Compiled::BloomMap {
+            exact_bloom: BloomFilter::from_items(&exact_items),
+            star_bloom: BloomFilter::from_items(&star_items),
+            dot_bloom: BloomFilter::from_items(&dot_items),
+            exact: exact_map,
+            star: star_map,
+            dot: dot_map,
         }
     }
 
