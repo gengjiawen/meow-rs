@@ -117,10 +117,30 @@ pub fn parse_opts(s: &str) -> Result<V2rayPluginConfig> {
     Ok(cfg)
 }
 
+/// Build a reusable `TlsLayer` for a v2ray-plugin config with `tls=true`.
+///
+/// Call once at adapter construction time. Returns `None` when TLS is disabled.
+pub fn build_tls_layer(cfg: &V2rayPluginConfig) -> Result<Option<TlsLayer>> {
+    if !cfg.tls {
+        return Ok(None);
+    }
+    let tls_config = TlsConfig {
+        skip_cert_verify: cfg.skip_cert_verify,
+        ..TlsConfig::new(cfg.host.clone())
+    };
+    TlsLayer::new(&tls_config)
+        .map(Some)
+        .map_err(transport_to_proxy_err)
+}
+
 /// Dial a TCP (+ optional TLS) + WebSocket connection to `server_host:server_port`
 /// and return the framed stream ready to be wrapped by the SS encryption layer.
+///
+/// When `tls_layer` is `Some`, it is reused across connections so the
+/// BoringSSL `SSL_CTX` and root cert store are allocated only once.
 pub async fn dial(
     cfg: &V2rayPluginConfig,
+    tls_layer: Option<&TlsLayer>,
     server_host: &str,
     server_port: u16,
 ) -> Result<Box<dyn meow_transport::Stream>> {
@@ -140,15 +160,9 @@ pub async fn dial(
         .await
         .map_err(MeowError::Io)?;
 
-    // 2) Optional TLS handshake via TlsLayer.
-    let stream: Box<dyn meow_transport::Stream> = if cfg.tls {
-        let tls_config = TlsConfig {
-            skip_cert_verify: cfg.skip_cert_verify,
-            ..TlsConfig::new(host_header.clone())
-        };
-        let tls_layer = TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)?;
-        tls_layer
-            .connect(Box::new(tcp))
+    // 2) Optional TLS handshake via the pre-built TlsLayer.
+    let stream: Box<dyn meow_transport::Stream> = if let Some(tls) = tls_layer {
+        tls.connect(Box::new(tcp))
             .await
             .map_err(transport_to_proxy_err)?
     } else {

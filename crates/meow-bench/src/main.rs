@@ -3,6 +3,7 @@ mod bench_connrate;
 mod bench_dns;
 mod bench_idle_conns;
 mod bench_latency;
+mod bench_memleak;
 mod bench_memory;
 mod bench_throughput;
 mod echo_server;
@@ -61,9 +62,26 @@ struct Args {
     #[arg(long, default_value = "64")]
     concurrency: usize,
 
-    /// Run only a specific benchmark
+    /// Run only a specific benchmark (throughput, latency, connrate, dns, memleak)
     #[arg(long)]
     only: Option<String>,
+
+    /// Config for the memleak test (separate from the perf-bench config,
+    /// because it needs a live proxy with internet access, e.g. ECH-TLS-tunnel)
+    #[arg(long, default_value = "config.yaml")]
+    memleak_config: PathBuf,
+
+    /// Number of rounds for the memleak test
+    #[arg(long, default_value = "10")]
+    memleak_rounds: usize,
+
+    /// Connections per round in the memleak test
+    #[arg(long, default_value = "200")]
+    memleak_conns: usize,
+
+    /// SOCKS5 port the memleak config listens on (must match the config's mixed-port)
+    #[arg(long, default_value = "17890")]
+    memleak_port: u16,
 }
 
 const PROXY_PORT: u16 = 17890;
@@ -299,6 +317,12 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("=== meow-rs benchmark suite ===\n");
 
+    // Memleak test is a standalone flow — it dials real external hosts through
+    // the proxy instead of using a local echo server.
+    if args.only.as_deref() == Some("memleak") {
+        return run_memleak_test(&args).await;
+    }
+
     // Benchmark Rust
     let rust_results = benchmark_target(&args.rust_binary, &args.config, "rust", &args).await?;
 
@@ -336,5 +360,78 @@ async fn main() -> anyhow::Result<()> {
         println!("{md}");
     }
 
+    Ok(())
+}
+
+async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{}", args.memleak_port).parse()?;
+
+    eprintln!(
+        "[memleak] config: {}  binary: {}",
+        args.memleak_config.display(),
+        args.rust_binary.display()
+    );
+
+    if !args.memleak_config.exists() {
+        anyhow::bail!(
+            "memleak config not found: {}  (create one with an ECH-TLS-tunnel proxy or pass --memleak-config)",
+            args.memleak_config.display()
+        );
+    }
+
+    eprintln!("[memleak] starting proxy...");
+    let mut child = Command::new(&args.rust_binary)
+        .args(["-f", &args.memleak_config.to_string_lossy()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", args.rust_binary.display()))?;
+
+    let pid = child.id();
+
+    if let Err(e) = wait_for_port(proxy_addr, Duration::from_secs(15)).await {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    eprintln!(
+        "[memleak] proxy ready (pid {pid}) on port {}",
+        args.memleak_port
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let rss_idle = bench_memory::measure_rss(pid)?;
+    eprintln!(
+        "[memleak] idle RSS: {:.1} MB",
+        rss_idle as f64 / 1_048_576.0
+    );
+
+    let result = bench_memleak::bench_memleak(
+        proxy_addr,
+        pid,
+        args.memleak_rounds,
+        args.memleak_conns,
+        args.concurrency,
+    )
+    .await?;
+
+    // Stop proxy
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let _ = child.wait();
+
+    let json = serde_json::to_string_pretty(&result)?;
+    if let Some(output_path) = &args.output {
+        std::fs::write(output_path, &json)?;
+        eprintln!("[memleak] results written to {}", output_path.display());
+    } else {
+        println!("{json}");
+    }
+
+    if result.slope_kb_per_round > 50.0 && result.r_squared > 0.7 {
+        std::process::exit(1);
+    }
     Ok(())
 }

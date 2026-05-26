@@ -135,10 +135,27 @@ pub fn parse_opts(s: &str) -> Result<EchTlsTunnelConfig> {
     })
 }
 
+/// Build a reusable `TlsLayer` from the parsed ECH config.
+///
+/// Call once at adapter construction time; the returned layer's
+/// `Transport::connect()` is safe to call from many tasks concurrently.
+pub fn build_tls_layer(cfg: &EchTlsTunnelConfig) -> Result<TlsLayer> {
+    let mut tls_config = TlsConfig::new(cfg.sni.clone());
+    tls_config.alpn = vec!["http/1.1".to_string()];
+    tls_config.ech = Some(EchOpts::Config(cfg.ech_config.clone()));
+    tls_config.fingerprint = cfg.fingerprint.clone();
+    TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)
+}
+
 /// Dial a TLS-with-ECH + WebSocket connection to `server_host:server_port`
 /// and return the framed stream ready for the SS encryption layer.
+///
+/// `tls_layer` must be the layer returned by [`build_tls_layer`] — it is
+/// reused across connections so the BoringSSL `SSL_CTX` and root cert store
+/// are allocated only once.
 pub async fn dial(
     cfg: &EchTlsTunnelConfig,
+    tls_layer: &TlsLayer,
     server_host: &str,
     server_port: u16,
 ) -> Result<Box<dyn meow_transport::Stream>> {
@@ -157,14 +174,8 @@ pub async fn dial(
         .map_err(MeowError::Io)?;
     let _ = tcp.set_nodelay(true);
 
-    // 2) TLS (with ECH). The outer SNI is taken from the ECHConfigList's
-    //    `public_name` field by rustls; the `sni` we supply here becomes the
-    //    encrypted inner ServerName and the cert-validation target.
-    let mut tls_config = TlsConfig::new(cfg.sni.clone());
-    tls_config.alpn = vec!["http/1.1".to_string()];
-    tls_config.ech = Some(EchOpts::Config(cfg.ech_config.clone()));
-    tls_config.fingerprint = cfg.fingerprint.clone();
-    let tls_layer = TlsLayer::new(&tls_config).map_err(transport_to_proxy_err)?;
+    // 2) TLS (with ECH). Reuse the pre-built TlsLayer — avoids rebuilding
+    //    the BoringSSL SSL_CTX and re-parsing ~150 root certs per connection.
     let tls_stream = tls_layer
         .connect(Box::new(tcp))
         .await

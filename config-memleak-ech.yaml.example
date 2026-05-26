@@ -1,0 +1,36 @@
+# Memory-leak test config for meow-bench --only memleak
+#
+# Copy this file to config-memleak-ech.yaml (gitignored) and fill in your
+# ECH-TLS-tunnel server details. Then run:
+#
+#   cargo run --bin meow-bench -- --only memleak \
+#       --memleak-config config-memleak-ech.yaml \
+#       --memleak-rounds 20 --memleak-conns 200 --concurrency 16
+
+mixed-port: 17890
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: warning
+ipv6: false
+
+dns:
+  enable: false
+
+proxies:
+  - name: ech-tunnel
+    type: ss
+    server: tunnel.example.com       # <-- your server hostname
+    port: 443
+    cipher: aes-128-gcm              # <-- your cipher
+    password: "your-password"        # <-- your password
+    udp: false
+    plugin: ech-tls-tunnel
+    plugin-opts:
+      mode: client
+      sni: tunnel.example.com       # <-- inner SNI (usually same as server)
+      path: /ws-secret              # <-- your WebSocket path
+      ech_config: "REPLACE_ME"      # <-- base64 ECHConfigList from server
+
+rules:
+  - MATCH,ech-tunnel

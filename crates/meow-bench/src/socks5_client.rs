@@ -54,3 +54,47 @@ pub async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> std::io::R
 
     Ok(stream)
 }
+
+/// SOCKS5 CONNECT via domain name (ATYP 0x03). Returns a stream tunneled to
+/// `host:port` through `proxy`.
+pub async fn socks5_connect_domain(
+    proxy: SocketAddr,
+    host: &str,
+    port: u16,
+) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy).await?;
+
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await?;
+    if buf[0] != 0x05 || buf[1] != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 auth failed: {:02x} {:02x}",
+            buf[0], buf[1]
+        )));
+    }
+
+    let host_bytes = host.as_bytes();
+    let len = host_bytes.len();
+    if len > 255 {
+        return Err(std::io::Error::other("domain name too long"));
+    }
+    // VER=5, CMD=CONNECT, RSV=0, ATYP=0x03 (domain), LEN, DOMAIN, PORT
+    let mut req = Vec::with_capacity(4 + 1 + len + 2);
+    req.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, len as u8]);
+    req.extend_from_slice(host_bytes);
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await?;
+
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await?;
+    if reply[0] != 0x05 || reply[1] != 0x00 {
+        return Err(std::io::Error::other(format!(
+            "SOCKS5 connect failed: reply status {:02x}",
+            reply[1]
+        )));
+    }
+
+    Ok(stream)
+}
