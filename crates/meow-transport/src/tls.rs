@@ -846,14 +846,14 @@ impl BoringInner {
                 .map_err(|e| TransportError::Tls(format!("boring: set_private_key: {e}")))?;
         }
 
-        // Disable the internal session cache. BoringSSL defaults to
-        // SSL_SESS_CACHE_BOTH with unbounded size — every completed
-        // handshake stores an SSL_SESSION in the SSL_CTX that is never
-        // evicted, leaking memory proportional to connection count.
-        // A proxy client dials many distinct servers and gains nothing
-        // from caching sessions to a single upstream; turning the cache
-        // off eliminates the leak with no performance cost.
-        b.set_session_cache_mode(boring::ssl::SslSessionCacheMode::OFF);
+        // BoringSSL defaults to SSL_SESS_CACHE_BOTH with unbounded size
+        // (0 = unlimited) — every completed handshake stores an
+        // SSL_SESSION that is never evicted, leaking memory proportional
+        // to connection count.  Cap at 64 entries: enough for TLS 1.3
+        // session-ticket resumption to the same upstream proxy server
+        // (saves one round-trip per resumed connection), small enough
+        // that memory is bounded even under sustained load.
+        b.set_session_cache_size(64);
 
         let connector = b.build();
         Ok(Self {
