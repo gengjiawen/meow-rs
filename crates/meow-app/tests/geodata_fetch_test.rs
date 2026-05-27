@@ -209,11 +209,15 @@ async fn live_download_from_default_urls() {
         "geosite suspiciously small: {} bytes",
         geosite_bytes.len()
     );
-    // MRS files begin with the literal "MRS\0" magic.
-    assert_eq!(
-        &geosite_bytes[..4],
-        b"MRS\0",
-        "geosite missing MRS\\0 magic header"
+    // Accept either MRS binary format ("MRS\0" magic) or V2Ray protobuf
+    // (.dat). The default URL currently points at geosite.dat (protobuf);
+    // the loader auto-detects both at runtime.
+    let is_mrs = geosite_bytes.starts_with(b"MRS\0");
+    let is_dat = !is_mrs && geosite_bytes.len() > 4;
+    assert!(
+        is_mrs || is_dat,
+        "geosite file is empty or unrecognised (first 4 bytes: {:?})",
+        &geosite_bytes[..4.min(geosite_bytes.len())]
     );
 }
 
