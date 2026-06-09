@@ -28,6 +28,10 @@ harness = false
 name = "regex_rules_bench"
 harness = false
 
+[[bench]]
+name = "ipcidr_ruleset_bench"
+harness = false
+
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }

@@ -13,7 +13,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use iprange::IpRange;
 use meow_common::{Metadata, Rule, RuleMatchHelper};
 use meow_trie::DomainTrie;
 use tracing::warn;
@@ -245,27 +246,47 @@ impl RuleSet for DomainRuleSet {
 // IpCidr
 // ---------------------------------------------------------------------------
 
+/// ipcidr rule-set backed by split `IpRange` Patricia tries — lookup is
+/// O(prefix-depth) instead of a linear scan over every CIDR. Country/ASN
+/// providers commonly carry thousands of entries, and every connection that
+/// reaches the rule paid O(N) comparisons with the previous `Vec<IpNet>`.
+/// Same structure `country_index.rs` already uses for GEOIP rules.
 pub struct IpCidrRuleSet {
-    cidrs: Vec<IpNet>,
+    v4: IpRange<Ipv4Net>,
+    v6: IpRange<Ipv6Net>,
+    /// Parsed-entry count, as reported by `len()`. Kept separately because
+    /// `simplify()` merges adjacent/nested networks inside the tries.
+    count: usize,
 }
 
 impl IpCidrRuleSet {
     pub fn from_entries(entries: &[String]) -> Self {
-        let mut cidrs = Vec::new();
+        let mut v4: IpRange<Ipv4Net> = IpRange::new();
+        let mut v6: IpRange<Ipv6Net> = IpRange::new();
+        let mut count = 0usize;
         for entry in entries {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
             match entry.parse::<IpNet>() {
-                Ok(net) => cidrs.push(net),
+                Ok(IpNet::V4(net)) => {
+                    v4.add(net);
+                    count += 1;
+                }
+                Ok(IpNet::V6(net)) => {
+                    v6.add(net);
+                    count += 1;
+                }
                 Err(e) => warn!(
                     "rule-set (ipcidr): skipping invalid entry '{}': {}",
                     entry, e
                 ),
             }
         }
-        Self { cidrs }
+        v4.simplify();
+        v6.simplify();
+        Self { v4, v6, count }
     }
 }
 
@@ -278,11 +299,18 @@ impl RuleSet for IpCidrRuleSet {
         let Some(ip) = metadata.dst_ip else {
             return false;
         };
-        self.cidrs.iter().any(|net| net.contains(&ip))
+        match ip {
+            std::net::IpAddr::V4(v4) => self
+                .v4
+                .contains(&Ipv4Net::new(v4, 32).expect("/32 is always valid")),
+            std::net::IpAddr::V6(v6) => self
+                .v6
+                .contains(&Ipv6Net::new(v6, 128).expect("/128 is always valid")),
+        }
     }
 
     fn len(&self) -> usize {
-        self.cidrs.len()
+        self.count
     }
 }
 
