@@ -199,9 +199,9 @@ impl DnsServer {
     fn parse_question(
         data: &[u8],
     ) -> Result<(String, u16, usize), Box<dyn std::error::Error + Send + Sync>> {
-        let mut labels = Vec::new();
+        // First pass: validate label framing and find the QNAME wire length,
+        // so the domain buffer below is allocated exactly once.
         let mut pos = 0;
-
         loop {
             if pos >= data.len() {
                 return Err("DNS question truncated".into());
@@ -214,8 +214,24 @@ impl DnsServer {
             if pos + 1 + len > data.len() {
                 return Err("DNS label truncated".into());
             }
-            labels.push(String::from_utf8_lossy(&data[pos + 1..pos + 1 + len]).to_string());
             pos += 1 + len;
+        }
+
+        // Second pass: append labels separated by '.' into one pre-sized
+        // String. `from_utf8_lossy` only allocates on invalid UTF-8, so the
+        // lossy semantics are preserved without per-label Strings.
+        let mut domain = String::with_capacity(pos.saturating_sub(2));
+        let mut lpos = 0;
+        loop {
+            let len = data[lpos] as usize;
+            if len == 0 {
+                break;
+            }
+            if !domain.is_empty() {
+                domain.push('.');
+            }
+            domain.push_str(&String::from_utf8_lossy(&data[lpos + 1..lpos + 1 + len]));
+            lpos += 1 + len;
         }
 
         if pos + 4 > data.len() {
@@ -224,7 +240,7 @@ impl DnsServer {
         let qtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         pos += 4; // skip type and class
 
-        Ok((labels.join("."), qtype, pos))
+        Ok((domain, qtype, pos))
     }
 
     fn build_response(
