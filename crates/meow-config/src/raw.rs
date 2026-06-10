@@ -291,7 +291,6 @@ pub struct RawSniffer {
     pub timeout: Option<u64>,
     pub parse_pure_ip: Option<bool>,
     pub override_destination: Option<bool>,
-    /// Accepted and ignored — we do not implement fake-ip.
     /// Accepted; respected when fake-ip mode is enabled. When true and the
     /// destination IP is a fake-IP allocation, the sniffer skips peek and
     /// trusts the fake-IP reverse mapping. Currently unused (the tunnel's

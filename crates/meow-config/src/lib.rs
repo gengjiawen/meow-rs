@@ -364,8 +364,9 @@ fn parse_sniffer_config(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::E
             // Warn-and-ignore force-dns-mapping.
             if rs.force_dns_mapping.unwrap_or(false) {
                 warn!(
-                    "sniffer.force-dns-mapping is accepted and ignored: \
-                    fake-ip is not implemented in meow-rs"
+                    "sniffer.force-dns-mapping is accepted and ignored: meow-rs \
+                    always maps fake-ip / snooped destinations back to their \
+                    domain via the DNS reverse table, so the flag has no effect"
                 );
             }
             let enable = rs.enable.unwrap_or(false);
