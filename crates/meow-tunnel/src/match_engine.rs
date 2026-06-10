@@ -38,22 +38,34 @@ impl DomainIndex {
     /// Build an index from the rule list, recording the first (minimum-index)
     /// occurrence of each domain pattern.
     pub fn build(rules: &[Box<dyn Rule>]) -> Self {
+        use std::borrow::Cow;
         let mut trie: DomainTrie<(usize, Arc<str>)> = DomainTrie::new();
         let mut seen: HashSet<String> = HashSet::new();
         for (idx, rule) in rules.iter().enumerate() {
             match rule.rule_type() {
                 RuleType::Domain | RuleType::DomainSuffix => {
-                    let pattern = rule.payload().to_lowercase();
-                    if seen.insert(pattern.clone()) {
-                        // For Domain: exact match pattern; trie handles it directly.
-                        // For DomainSuffix: use "+." prefix so trie matches subdomains.
-                        let trie_key = if rule.rule_type() == RuleType::DomainSuffix {
-                            format!("+.{pattern}")
-                        } else {
-                            pattern
-                        };
-                        trie.insert(&trie_key, (idx, Arc::from(rule.adapter())));
+                    // Patterns are normally already lowercase; only allocate
+                    // for the rare mixed-case entry, and check `seen` before
+                    // taking an owned copy — duplicates cost no allocation.
+                    let payload = rule.payload();
+                    let lowered: Cow<'_, str> = if payload.chars().any(char::is_uppercase) {
+                        Cow::Owned(payload.to_lowercase())
+                    } else {
+                        Cow::Borrowed(payload)
+                    };
+                    if seen.contains(lowered.as_ref()) {
+                        continue;
                     }
+                    let pattern = lowered.into_owned();
+                    // For Domain: exact match pattern; trie handles it directly.
+                    // For DomainSuffix: use "+." prefix so trie matches subdomains.
+                    if rule.rule_type() == RuleType::DomainSuffix {
+                        let trie_key = format!("+.{pattern}");
+                        trie.insert(&trie_key, (idx, Arc::from(rule.adapter())));
+                    } else {
+                        trie.insert(&pattern, (idx, Arc::from(rule.adapter())));
+                    }
+                    seen.insert(pattern);
                 }
                 _ => {}
             }

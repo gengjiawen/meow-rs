@@ -45,7 +45,8 @@ async fn run_health_check_loop(tunnel: Tunnel, spec: HealthCheckSpec) {
     loop {
         ticker.tick().await;
 
-        let proxies = tunnel.proxies();
+        let route = tunnel.route_snapshot();
+        let proxies = &route.proxies;
         let Some(group) = proxies.get(spec.group_name.as_str()).cloned() else {
             debug!(
                 "health-check: group '{}' not found, skipping tick",
@@ -61,7 +62,7 @@ async fn run_health_check_loop(tunnel: Tunnel, spec: HealthCheckSpec) {
             .into_iter()
             .filter_map(|n| proxies.get(n.as_str()).cloned().map(|p| (n, p)))
             .collect();
-        drop(proxies);
+        drop(route);
 
         let url = spec.url.clone();
         let mut set: tokio::task::JoinSet<(String, u16)> = tokio::task::JoinSet::new();

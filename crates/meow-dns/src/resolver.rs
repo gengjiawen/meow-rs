@@ -223,6 +223,11 @@ fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
 
 /// Query a pool of clients in parallel; return the first successful A+AAAA
 /// result. `select_ok` semantics — first `Ok` wins, remaining are cancelled.
+/// Unit error for racing upstream attempts: the failure detail is discarded
+/// by `select_ok` callers, so attempts must not allocate an error String.
+#[derive(Debug, Clone, Copy)]
+struct LookupFailed;
+
 async fn query_pool(clients: &[Arc<DnsClient>], host: &str) -> Option<(Vec<IpAddr>, Duration)> {
     match clients.len() {
         0 => None,
@@ -259,13 +264,16 @@ async fn query_pool(clients: &[Arc<DnsClient>], host: &str) -> Option<(Vec<IpAdd
             // ≥ 3 nameservers: fall back to select_ok with Vec<Pin<Box<…>>>.
             // host can still be borrowed because `select_ok` keeps the
             // futures alive only until it resolves.
+            // Unit error: the per-attempt failure reason is never read
+            // (select_ok only reports the last error), so don't format!
+            // an error String per failed attempt.
             let futs: Vec<_> = clients
                 .iter()
                 .map(|c| {
                     Box::pin(async move {
-                        let (ips, ttl) = c.lookup_ip(host).await.map_err(|e| format!("{e}"))?;
+                        let (ips, ttl) = c.lookup_ip(host).await.map_err(|_| LookupFailed)?;
                         if ips.is_empty() {
-                            return Err("empty".to_string());
+                            return Err(LookupFailed);
                         }
                         Ok((ips, clamp_ttl(ttl)))
                     })
@@ -305,7 +313,7 @@ async fn query_pool_generic(
                 .iter()
                 .map(|c| {
                     Box::pin(
-                        async move { c.query(host, record_type).await.map_err(|e| format!("{e}")) },
+                        async move { c.query(host, record_type).await.map_err(|_| LookupFailed) },
                     )
                 })
                 .collect();

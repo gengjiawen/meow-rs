@@ -287,8 +287,13 @@ impl Tunnel {
         &self.inner.resolver
     }
 
-    pub fn proxies(&self) -> HashMap<SmolStr, Arc<dyn Proxy>> {
-        self.inner.route.load().proxies.clone()
+    /// Snapshot of the current route table (rules + domain index + proxies).
+    ///
+    /// One atomic load + refcount bump; callers iterate `snapshot.proxies`
+    /// / `snapshot.rules` in place. Replaces the old `proxies()` accessor,
+    /// which cloned the whole proxy map on every call (audit #182).
+    pub fn route_snapshot(&self) -> Arc<RouteTable> {
+        self.inner.route.load_full()
     }
 
     pub fn proxy(&self, name: &str) -> Option<Arc<dyn Proxy>> {
@@ -303,22 +308,6 @@ impl Tunnel {
             udp::DEFAULT_UDP_IDLE,
             udp::DEFAULT_SWEEP_INTERVAL,
         );
-    }
-
-    pub fn rules_info(&self) -> Vec<(String, String, String)> {
-        self.inner
-            .route
-            .load()
-            .rules
-            .iter()
-            .map(|r| {
-                (
-                    format!("{}", r.rule_type()),
-                    r.payload().to_string(),
-                    r.adapter().to_string(),
-                )
-            })
-            .collect()
     }
 }
 

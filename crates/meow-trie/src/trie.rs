@@ -180,13 +180,14 @@ impl<T: Clone + 'static> DomainTrie<T> {
     }
 
     fn search_build<'a>(root: &'a BuildNode<T>, query: &str) -> Option<&'a T> {
-        let labels: smallvec::SmallVec<[&str; 8]> = query.rsplit('.').collect();
-        let n = labels.len();
+        // Count labels up front (dots + 1) so `remaining` is known while
+        // iterating `rsplit` directly — no per-search SmallVec collection.
+        let n = query.bytes().filter(|&b| b == b'.').count() + 1;
         let mut node = root;
         let mut best: Option<&T> = None;
 
-        for (d, label) in labels.iter().enumerate() {
-            match node.children.get(*label) {
+        for (d, label) in query.rsplit('.').enumerate() {
+            match node.children.get(label) {
                 None => break,
                 Some(child) => {
                     node = child;
@@ -211,12 +212,12 @@ impl<T: Clone + 'static> DomainTrie<T> {
     }
 
     fn search_sealed<'a>(root: &'a SealedNode<T>, query: &str) -> Option<&'a T> {
-        let labels: smallvec::SmallVec<[&str; 8]> = query.rsplit('.').collect();
-        let n = labels.len();
+        // Same direct-rsplit iteration as `search_build` — see comment there.
+        let n = query.bytes().filter(|&b| b == b'.').count() + 1;
         let mut node = root;
         let mut best: Option<&T> = None;
 
-        for (d, label) in labels.iter().enumerate() {
+        for (d, label) in query.rsplit('.').enumerate() {
             let found = node
                 .children
                 .binary_search_by(|(k, _)| k.as_bytes().cmp(label.as_bytes()));

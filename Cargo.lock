@@ -2239,7 +2239,6 @@ version = "0.13.0"
 dependencies = [
  "criterion",
  "proptest",
- "smallvec",
 ]
 
 [[package]]

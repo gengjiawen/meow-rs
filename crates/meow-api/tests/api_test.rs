@@ -1618,7 +1618,8 @@ async fn a1_get_proxy_delay_ok_records_delay() {
     assert!(delay > 0, "delay must be positive, got {delay}");
     assert_eq!(body.as_object().unwrap().len(), 1, "only the delay key");
     // Verify recorded into history
-    let proxies = state.tunnel.proxies();
+    let route = state.tunnel.route_snapshot();
+    let proxies = &route.proxies;
     let proxy = proxies.get("T").unwrap();
     assert_eq!(proxy.delay_history().len(), 1);
 }

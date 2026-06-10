@@ -96,7 +96,8 @@ impl TProxyListener {
 /// Collect all upstream proxy server IPs from the tunnel's proxy map.
 /// These IPs must be excluded from firewall redirection to prevent loops.
 fn collect_proxy_server_ips(tunnel: &Tunnel) -> Vec<IpAddr> {
-    let proxies = tunnel.proxies();
+    let route = tunnel.route_snapshot();
+    let proxies = &route.proxies;
     let mut ips = HashSet::new();
 
     for proxy in proxies.values() {

@@ -83,26 +83,26 @@ async fn handle_socks5_inner(
         if sub_ver[0] != 0x01 {
             return Err("invalid auth sub-negotiation version".into());
         }
+        // Borrow username/password from stack buffers; the username is only
+        // copied to the heap after a successful verify (audit #182 — the
+        // failure/empty path previously allocated two Strings regardless).
         let mut ulen = [0u8; 1];
         stream.read_exact(&mut ulen).await?;
-        let mut auth_buf = [0u8; 255];
-        stream.read_exact(&mut auth_buf[..ulen[0] as usize]).await?;
-        let username = std::str::from_utf8(&auth_buf[..ulen[0] as usize])
-            .unwrap_or_default()
-            .to_string();
+        let mut user_buf = [0u8; 255];
+        stream.read_exact(&mut user_buf[..ulen[0] as usize]).await?;
+        let username = std::str::from_utf8(&user_buf[..ulen[0] as usize]).unwrap_or_default();
         let mut plen = [0u8; 1];
         stream.read_exact(&mut plen).await?;
-        stream.read_exact(&mut auth_buf[..plen[0] as usize]).await?;
-        let password = std::str::from_utf8(&auth_buf[..plen[0] as usize])
-            .unwrap_or_default()
-            .to_string();
+        let mut pass_buf = [0u8; 255];
+        stream.read_exact(&mut pass_buf[..plen[0] as usize]).await?;
+        let password = std::str::from_utf8(&pass_buf[..plen[0] as usize]).unwrap_or_default();
 
-        if !auth.credentials.verify(&username, &password) {
+        if !auth.credentials.verify(username, password) {
             stream.write_all(&[0x01, 0x01]).await?;
             return Err(format!("SOCKS5 auth failed for user {username:?}").into());
         }
         stream.write_all(&[0x01, 0x00]).await?;
-        Some(username)
+        Some(username.to_string())
     } else {
         // No auth required
         stream.write_all(&[SOCKS5_VERSION, NO_AUTH]).await?;

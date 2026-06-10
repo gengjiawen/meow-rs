@@ -101,10 +101,11 @@ pub async fn run_on_startup(
 ) {
     let targets = compute_targets(&geo);
 
-    let proxies = tunnel.proxies();
+    let route = tunnel.route_snapshot();
+    let proxies = &route.proxies;
     let download_proxy = meow_config::internal_http::first_named_proxy(
         raw_config.read().proxies.as_deref(),
-        &proxies,
+        proxies,
     );
 
     let downloaded = fetch_missing(&targets, download_proxy.as_ref()).await;
@@ -158,10 +159,11 @@ pub async fn auto_update_loop(
 
         let mut any_updated = false;
 
-        let proxies = tunnel.proxies();
+        let route = tunnel.route_snapshot();
+        let proxies = &route.proxies;
         let download_proxy = meow_config::internal_http::first_named_proxy(
             raw_config.read().proxies.as_deref(),
-            &proxies,
+            proxies,
         );
 
         if let Err(e) =

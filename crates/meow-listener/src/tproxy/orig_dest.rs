@@ -91,10 +91,22 @@ mod macos {
 
         let listen_port = listen_addr.port();
 
-        let pf_fd = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/pf")?;
+        // /dev/pf is opened once and cached for the process lifetime —
+        // opening it per connection cost an open/close syscall pair on
+        // every accepted tproxy connection (audit #182). Only success is
+        // cached, so a transient failure (pf not loaded yet) can recover.
+        static PF_FD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+        let pf_fd = match PF_FD.get() {
+            Some(f) => f,
+            None => {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/pf")?;
+                // A racing open just drops the extra fd.
+                PF_FD.get_or_init(|| f)
+            }
+        };
 
         let mut nl = PfiocNatlook {
             af: PF_ADDR_IPV4,

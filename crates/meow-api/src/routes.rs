@@ -289,9 +289,9 @@ struct ProxiesResponse {
 }
 
 async fn get_proxies(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse> {
-    let proxies = state.tunnel.proxies();
+    let route = state.tunnel.route_snapshot();
     let mut result = std::collections::HashMap::new();
-    for (name, proxy) in &proxies {
+    for (name, proxy) in &route.proxies {
         result.insert(name.to_string(), ProxyInfo::from_proxy(proxy));
     }
     Json(ProxiesResponse { proxies: result })
@@ -301,8 +301,11 @@ async fn get_proxy(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ProxyInfo>, StatusCode> {
-    let proxies = state.tunnel.proxies();
-    let proxy = proxies.get(name.as_str()).ok_or(StatusCode::NOT_FOUND)?;
+    let route = state.tunnel.route_snapshot();
+    let proxy = route
+        .proxies
+        .get(name.as_str())
+        .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(ProxyInfo::from_proxy(proxy)))
 }
 
@@ -317,8 +320,8 @@ async fn update_proxy(
     Json(body): Json<UpdateProxyRequest>,
 ) -> StatusCode {
     use meow_proxy::SelectorGroup;
-    let proxies = state.tunnel.proxies();
-    if let Some(proxy) = proxies.get(group_name.as_str()) {
+    let route = state.tunnel.route_snapshot();
+    if let Some(proxy) = route.proxies.get(group_name.as_str()) {
         if let Some(selector) = proxy
             .as_any()
             .and_then(|a| a.downcast_ref::<SelectorGroup>())
@@ -334,29 +337,32 @@ async fn update_proxy(
 }
 
 #[derive(Serialize)]
-struct RuleInfo {
+struct RuleInfo<'a> {
     #[serde(rename = "type")]
-    rule_type: String,
-    payload: String,
-    proxy: String,
+    rule_type: &'static str,
+    payload: &'a str,
+    proxy: &'a str,
 }
 
 #[derive(Serialize)]
-struct RulesResponse {
-    rules: Vec<RuleInfo>,
+struct RulesResponse<'a> {
+    rules: Vec<RuleInfo<'a>>,
 }
 
-async fn get_rules(State(state): State<Arc<AppState>>) -> Json<RulesResponse> {
-    let rules = state.tunnel.rules_info();
-    let result: Vec<RuleInfo> = rules
-        .into_iter()
-        .map(|(rt, payload, adapter)| RuleInfo {
-            rule_type: rt,
-            payload,
-            proxy: adapter,
+async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
+    // Serialise straight off the route snapshot — the old rules_info()
+    // accessor built 3 Strings per rule per call (audit #182).
+    let route = state.tunnel.route_snapshot();
+    let result: Vec<RuleInfo> = route
+        .rules
+        .iter()
+        .map(|r| RuleInfo {
+            rule_type: r.rule_type().as_str(),
+            payload: r.payload(),
+            proxy: r.adapter(),
         })
         .collect();
-    Json(RulesResponse { rules: result })
+    Json(RulesResponse { rules: result }).into_response()
 }
 
 #[derive(Serialize)]
@@ -736,7 +742,8 @@ struct ProxyGroupInfo {
 async fn get_proxy_groups(State(state): State<Arc<AppState>>) -> Json<Vec<ProxyGroupInfo>> {
     let raw = state.raw_config.read();
     let groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
-    let tunnel_proxies = state.tunnel.proxies();
+    let route = state.tunnel.route_snapshot();
+    let tunnel_proxies = &route.proxies;
 
     let result: Vec<ProxyGroupInfo> = groups
         .iter()
@@ -864,8 +871,8 @@ async fn select_proxy_in_group(
     Json(body): Json<SelectProxyRequest>,
 ) -> StatusCode {
     use meow_proxy::SelectorGroup;
-    let proxies = state.tunnel.proxies();
-    if let Some(proxy) = proxies.get(group_name.as_str()) {
+    let route = state.tunnel.route_snapshot();
+    if let Some(proxy) = route.proxies.get(group_name.as_str()) {
         if let Some(selector) = proxy
             .as_any()
             .and_then(|a| a.downcast_ref::<SelectorGroup>())
@@ -1039,12 +1046,12 @@ async fn get_proxy_delay(
     let url = params.url.as_deref().unwrap_or("").to_string();
     let expected = params.expected.clone();
 
-    let proxies = state.tunnel.proxies();
+    let route = state.tunnel.route_snapshot();
     // upstream: hub/route/proxies.go::getProxyDelay — findProxyByName middleware
-    let Some(proxy) = proxies.get(name.as_str()).cloned() else {
+    let Some(proxy) = route.proxies.get(name.as_str()).cloned() else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
-    drop(proxies);
+    drop(route);
 
     match probe_and_record(&proxy, &url, expected.as_deref(), timeout).await {
         Ok(delay) => Json(DelayResp { delay }).into_response(),
@@ -1072,8 +1079,8 @@ async fn get_group_delay(
     let url = params.url.as_deref().unwrap_or("").to_string();
     let expected = params.expected.clone();
 
-    let proxies = state.tunnel.proxies();
-    let Some(group) = proxies.get(name.as_str()).cloned() else {
+    let route = state.tunnel.route_snapshot();
+    let Some(group) = route.proxies.get(name.as_str()).cloned() else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
     // upstream: findProxyByName rejects non-groups with 404 for this route.
@@ -1085,9 +1092,9 @@ async fn get_group_delay(
     // proxies map so the spawned tasks hold their own Arc clones.
     let members: Vec<(String, Arc<dyn meow_common::Proxy>)> = member_names
         .into_iter()
-        .filter_map(|n| proxies.get(n.as_str()).cloned().map(|p| (n, p)))
+        .filter_map(|n| route.proxies.get(n.as_str()).cloned().map(|p| (n, p)))
         .collect();
-    drop(proxies);
+    drop(route);
 
     let url_shared = Arc::new(url);
     let expected_shared = Arc::new(expected);
@@ -1289,7 +1296,8 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Response {
     // meow_proxy_alive and meow_proxy_delay_ms — gauge{proxy_name,adapter_type}
     let proxy_alive = Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
     let proxy_delay = Family::<Vec<(String, String)>, Gauge<i64, AtomicI64>>::default();
-    for (name, proxy) in state.tunnel.proxies() {
+    let route = state.tunnel.route_snapshot();
+    for (name, proxy) in &route.proxies {
         let labels = vec![
             ("proxy_name".to_string(), name.to_string()),
             ("adapter_type".to_string(), proxy.adapter_type().to_string()),
