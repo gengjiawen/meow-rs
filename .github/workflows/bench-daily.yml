@@ -1,0 +1,85 @@
+name: Daily Benchmark
+
+on:
+  schedule:
+    # 03:17 UTC daily (off the top of the hour to avoid scheduler congestion)
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Steady-state duration per workload (seconds)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-daily
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: Run benchmark harness (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-daily-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: bench-daily-${{ runner.os }}-
+
+      - name: Build release binaries
+        run: cargo build --release -p meow-app -p meow-bench
+
+      - name: Run benchmark harness
+        env:
+          DURATION: ${{ github.event.inputs.duration || '30' }}
+          # bench.sh uses `gh release download` to fetch the Go mihomo binary
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p target/bench
+          bash bench.sh | tee target/bench/results.md
+
+      - name: Publish results to run summary
+        if: always()
+        run: |
+          {
+            echo "## Daily benchmark — $(date -u +%F)"
+            echo ""
+            echo '```'
+            cat target/bench/results.md
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check regression vs baseline
+        # Non-blocking: the checked-in baseline was measured on the dedicated
+        # bench box (docs/benchmarks/hardware.md); GitHub-hosted runners are
+        # slower and noisier, so absolute deltas are informational only.
+        # Day-over-day tracking comes from the uploaded artifacts.
+        if: hashFiles('docs/benchmarks/baseline-*.json') != ''
+        continue-on-error: true
+        run: |
+          BASELINE=$(ls docs/benchmarks/baseline-*.json | sort | tail -1)
+          python3 bench/compare.py "$BASELINE" target/bench/results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-daily-${{ github.run_id }}
+          path: |
+            target/bench/results.json
+            target/bench/results.md
+          retention-days: 90
