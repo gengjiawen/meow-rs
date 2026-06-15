@@ -1041,6 +1041,62 @@ mod tests {
         assert!(faked.fake_ip_active_for("example.com"));
     }
 
+    /// Dual-stack contract that the stripped-HTTPS path relies on: with the
+    /// IP hints removed, the client falls back to A/AAAA, so the per-family
+    /// fake synthesis must do the right thing for each pool configuration.
+    #[tokio::test]
+    async fn fake_ip_dual_stack_synthesis_is_per_family() {
+        use crate::fakeip::MemoryStore;
+
+        let v4_pool = || {
+            Arc::new(
+                Pool::new(
+                    "198.18.0.0/16".parse().unwrap(),
+                    Arc::new(MemoryStore::new(1024)),
+                )
+                .unwrap(),
+            )
+        };
+
+        // v4-only pool (the common default): A synthesises a v4 fake; AAAA is
+        // suppressed (None → server emits NOERROR-empty) so a dual-stack
+        // client cleanly falls back to the v4 fake instead of stalling.
+        let mut v4_only = Resolver::new(vec![], vec![], DnsMode::FakeIp, DomainTrie::new(), true);
+        v4_only.set_fakeip_v4(v4_pool());
+        let a = v4_only.lookup_ipv4("example.com").await;
+        assert!(
+            a.is_some_and(|ip| ip.is_ipv4() && v4_only.is_fake_ip(ip)),
+            "A must return a v4 fake IP"
+        );
+        assert_eq!(
+            v4_only.lookup_ipv6("example.com").await,
+            None,
+            "v4-only pool must suppress AAAA so the client uses the v4 fake"
+        );
+
+        // Dual pool: both families synthesise → Happy Eyeballs picks between
+        // two fakes, both of which route through the tunnel.
+        let mut dual = Resolver::new(vec![], vec![], DnsMode::FakeIp, DomainTrie::new(), true);
+        dual.set_fakeip_v4(v4_pool());
+        dual.set_fakeip_v6(Arc::new(
+            Pool::new(
+                "fc00::/64".parse().unwrap(),
+                Arc::new(MemoryStore::new(1024)),
+            )
+            .unwrap(),
+        ));
+        let a = dual.lookup_ipv4("example.com").await;
+        let aaaa = dual.lookup_ipv6("example.com").await;
+        assert!(
+            a.is_some_and(|ip| ip.is_ipv4() && dual.is_fake_ip(ip)),
+            "A must return a v4 fake IP"
+        );
+        assert!(
+            aaaa.is_some_and(|ip| ip.is_ipv6() && dual.is_fake_ip(ip)),
+            "AAAA must return a v6 fake IP when a v6 pool is configured"
+        );
+    }
+
     #[test]
     fn clamp_ttl_zero_returns_min() {
         assert_eq!(clamp_ttl(Duration::ZERO), Duration::from_secs(10));
