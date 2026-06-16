@@ -544,7 +544,7 @@ fn build_reality_client_hello(
     put_u24(body.len(), &mut hello);
     hello.extend_from_slice(&body);
 
-    let auth_key = hkdf_sha256(auth_key, &hello[4 + 2..4 + 2 + 20], b"REALITY", 32)?;
+    let auth_key = hkdf_sha256(auth_key, &hello[4 + 2..4 + 2 + 20], b"REALITY", 32);
     let mut aead_key = [0u8; 32];
     aead_key.copy_from_slice(&auth_key);
 
@@ -1165,9 +1165,9 @@ fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) ->
     hkdf_expand(secret, &info, len)
 }
 
-fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>> {
+fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     let prk = hkdf_extract(salt, secret);
-    Ok(hkdf_expand(&prk, info, len))
+    hkdf_expand(&prk, info, len)
 }
 
 fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {

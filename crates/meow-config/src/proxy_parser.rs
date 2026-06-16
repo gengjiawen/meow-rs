@@ -1399,7 +1399,7 @@ fn parse_vless_reality_opts(
 
 #[cfg(feature = "vless")]
 fn parse_reality_short_id(s: &str) -> std::result::Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 || s.len() / 2 > 8 {
+    if !s.len().is_multiple_of(2) || s.len() / 2 > 8 {
         return Err("vless: invalid REALITY short ID".into());
     }
 
