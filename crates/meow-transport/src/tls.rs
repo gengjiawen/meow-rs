@@ -1046,7 +1046,7 @@ impl BoringInner {
             Ok(tls_stream) => {
                 let ech_accepted = tls_stream.ssl().ech_accepted();
                 let version = tls_stream.ssl().version_str();
-                tracing::info!(
+                tracing::debug!(
                     sni = %self.server_name,
                     ech_requested = ech_requested,
                     ech_accepted = ech_accepted,

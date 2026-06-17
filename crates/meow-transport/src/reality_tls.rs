@@ -207,7 +207,7 @@ async fn reality_handshake(
     client_random.fill(0);
     client_private.fill(0);
 
-    tracing::info!("Reality TLS handshake complete");
+    tracing::debug!("Reality TLS handshake complete");
     Ok(RealityConnected {
         inner,
         read_key: app.server,
