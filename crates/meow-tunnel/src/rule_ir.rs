@@ -64,7 +64,7 @@ enum RuleOp {
     DomainSuffix(String),
     DomainKeyword(String),
     DomainRegex(Box<RegexMatcher>),
-    DomainWildcard(Box<RegexMatcher>),
+    DomainWildcard(Box<WildcardMatcher>),
     IpCidr { net: IpNet, src: bool },
     SrcPort(PortMatcher),
     DstPort(PortMatcher),
@@ -444,7 +444,8 @@ fn matches_op(op: &RuleOp, input: &MatchInput<'_>) -> bool {
         RuleOp::Domain(domain) => input.host.eq_ignore_ascii_case(domain),
         RuleOp::DomainSuffix(suffix) => domain_suffix_matches(input.host, suffix),
         RuleOp::DomainKeyword(keyword) => domain_keyword_matches(input.host, keyword),
-        RuleOp::DomainRegex(regex) | RuleOp::DomainWildcard(regex) => regex.matches(input.host),
+        RuleOp::DomainRegex(regex) => regex.matches(input.host),
+        RuleOp::DomainWildcard(matcher) => matcher.matches(input.host),
         RuleOp::IpCidr { net, src } => {
             let ip = if *src {
                 input.metadata.src_ip
@@ -517,13 +518,139 @@ fn compile_domain_regex(pattern: &str) -> Option<Box<RegexMatcher>> {
     }))
 }
 
-fn compile_domain_wildcard(pattern: &str) -> Option<Box<RegexMatcher>> {
+/// A compiled DOMAIN-WILDCARD matcher.
+///
+/// Almost all wildcard patterns lower to a structural [`GlobMatcher`] that
+/// matches with byte comparisons and never touches the regex engine on the
+/// rule hot path. The rare shape the structural matcher declines (adjacent
+/// `*`, i.e. an empty interior segment) falls back to the original anchored
+/// regex so semantics stay identical.
+#[derive(Debug, Clone)]
+enum WildcardMatcher {
+    Glob(GlobMatcher),
+    Regex(Box<RegexMatcher>),
+}
+
+impl WildcardMatcher {
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            Self::Glob(glob) => glob.matches(host),
+            Self::Regex(regex) => regex.matches(host),
+        }
+    }
+}
+
+/// Structural matcher for DOMAIN-WILDCARD patterns.
+///
+/// A wildcard pattern is a list of literal pieces separated by `*`, where each
+/// `*` matches one or more non-`.` bytes (a single DNS label fragment). This
+/// reproduces the wildcard regex `^(?i)<escaped, \* -> [^.]+>$` exactly for the
+/// ASCII hostnames that reach rule matching, but evaluates with anchored
+/// byte comparisons instead of running the regex engine per connection.
+#[derive(Debug, Clone)]
+struct GlobMatcher {
+    /// Literal pieces in pattern order. The first piece is anchored at the
+    /// start of the host and the last piece at the end; every adjacent pair is
+    /// separated by exactly one `*` consuming one or more non-`.` bytes. A
+    /// single piece (no `*`) degenerates to an exact match.
+    pieces: Box<[Box<[u8]>]>,
+}
+
+impl GlobMatcher {
+    /// Compile a wildcard pattern into anchored literal pieces, or return
+    /// `None` for shapes the structural matcher does not handle (adjacent `*`,
+    /// which leaves an empty interior piece) so the caller can fall back to a
+    /// regex.
+    fn compile(pattern: &str) -> Option<Self> {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        // An interior piece sits between two stars; since each star already
+        // requires >=1 byte, an empty interior piece means adjacent stars,
+        // which we leave to the regex fallback rather than special-case here.
+        if parts.len() >= 3 && parts[1..parts.len() - 1].iter().any(|p| p.is_empty()) {
+            return None;
+        }
+        let pieces = parts
+            .into_iter()
+            .map(|p| Box::<[u8]>::from(p.as_bytes()))
+            .collect();
+        Some(Self { pieces })
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        let host = host.as_bytes();
+        let pieces = &self.pieces;
+
+        // No `*`: exact, case-insensitive match.
+        if pieces.len() == 1 {
+            return host.eq_ignore_ascii_case(&pieces[0]);
+        }
+
+        // First piece anchored at the start.
+        let first = &pieces[0];
+        if host.len() < first.len() || !host[..first.len()].eq_ignore_ascii_case(first) {
+            return false;
+        }
+        let mut pos = first.len();
+
+        // Interior pieces float: each is preceded by a `*` that must consume a
+        // non-empty, dot-free gap. Match each at its earliest valid position,
+        // which leaves the most host for the remaining pieces.
+        for mid in &pieces[1..pieces.len() - 1] {
+            match find_after_dotfree_gap(host, pos, mid) {
+                Some(start) => pos = start + mid.len(),
+                None => return false,
+            }
+        }
+
+        // Last piece anchored at the end, preceded by a non-empty dot-free gap.
+        let last = &pieces[pieces.len() - 1];
+        if host.len() < last.len() {
+            return false;
+        }
+        let tail_start = host.len() - last.len();
+        if tail_start <= pos {
+            return false;
+        }
+        if !host[tail_start..].eq_ignore_ascii_case(last) {
+            return false;
+        }
+        !host[pos..tail_start].contains(&b'.')
+    }
+}
+
+/// Earliest `start > pos` such that `host[pos..start]` is non-empty and
+/// dot-free and `needle` matches case-insensitively at `start`. Returns `None`
+/// once a `.` in the gap rules out any later start, or `needle` cannot fit.
+/// `needle` is always non-empty (empty interior pieces are rejected at compile
+/// time).
+fn find_after_dotfree_gap(host: &[u8], pos: usize, needle: &[u8]) -> Option<usize> {
+    let mut start = pos + 1;
+    while start + needle.len() <= host.len() {
+        // The byte just added to the gap must not be a dot; once it is, no
+        // later start keeps the gap dot-free either.
+        if host[start - 1] == b'.' {
+            return None;
+        }
+        if host[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
+fn compile_domain_wildcard(pattern: &str) -> Option<Box<WildcardMatcher>> {
+    if let Some(glob) = GlobMatcher::compile(pattern) {
+        return Some(Box::new(WildcardMatcher::Glob(glob)));
+    }
+    // Fallback for shapes the structural matcher declines: keep the original
+    // anchored regex so wildcard semantics remain identical.
     let escaped = regex::escape(pattern);
     let expanded = escaped.replace(r"\*", r"[^.]+");
-    Some(Box::new(RegexMatcher {
+    Some(Box::new(WildcardMatcher::Regex(Box::new(RegexMatcher {
         regex: Regex::new(&format!("^(?i){expanded}$")).ok()?,
         required_literal: required_literal_from_wildcard(pattern),
-    }))
+    }))))
 }
 
 fn required_literal_from_plain_regex(pattern: &str) -> Option<String> {
@@ -988,6 +1115,83 @@ mod tests {
 
             assert_eq!(compiled, legacy, "metadata host={}", metadata.host);
         }
+    }
+
+    #[test]
+    fn glob_matcher_matches_wildcard_regex_semantics() {
+        // Reference: the exact regex the legacy DomainWildcardRule compiles.
+        fn reference(pattern: &str) -> Regex {
+            let escaped = regex::escape(pattern);
+            let expanded = escaped.replace(r"\*", r"[^.]+");
+            Regex::new(&format!("^(?i){expanded}$")).unwrap()
+        }
+
+        let patterns = [
+            "*.example.com",
+            "example.*",
+            "*example.com",
+            "*.example.*",
+            "*.*.example.com",
+            "a*b.example.com",
+            "foo*bar*baz.com",
+            "www.*.example.com",
+            "*.co.uk",
+            "*",
+            "*.*",
+            "**.example.com", // adjacent stars -> regex fallback path
+            "exact.example.com",
+        ];
+        let hosts = [
+            "",
+            "example.com",
+            "a.example.com",
+            "a.b.example.com",
+            "a.b.c.example.com",
+            "one.example.com",
+            "example.org",
+            "x.co.uk",
+            "a.b.co.uk",
+            "fooXbar.example.com",
+            "fooXbarYbaz.com",
+            "wwwy.example.com",
+            "www.api.example.com",
+            "www.a.b.example.com",
+            "fooexample.com",
+            ".example.com",
+            "exact.example.com",
+            "EXACT.EXAMPLE.COM",
+            "ONE.EXAMPLE.COM",
+        ];
+
+        for pattern in patterns {
+            let re = reference(pattern);
+            let matcher = compile_domain_wildcard(pattern).expect("wildcard must compile");
+            for host in hosts {
+                assert_eq!(
+                    matcher.matches(host),
+                    re.is_match(host),
+                    "pattern={pattern:?} host={host:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn common_wildcards_compile_to_glob_not_regex() {
+        for pattern in ["*.example.com", "example.*", "*.example.*", "a*b.com"] {
+            assert!(
+                matches!(
+                    *compile_domain_wildcard(pattern).unwrap(),
+                    WildcardMatcher::Glob(_)
+                ),
+                "expected structural glob for {pattern:?}",
+            );
+        }
+        // Adjacent stars are the documented fallback to the regex engine.
+        assert!(matches!(
+            *compile_domain_wildcard("**.example.com").unwrap(),
+            WildcardMatcher::Regex(_)
+        ));
     }
 
     #[derive(Default)]
