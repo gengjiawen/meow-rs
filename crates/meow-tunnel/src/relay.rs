@@ -13,10 +13,11 @@
 //   Public API: `copy_bidirectional_buf` and `RELAY_BUF_SIZE`.
 //   No new public types exposed — no M2 API break.
 
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Buffer size used for each relay direction.
@@ -24,6 +25,20 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// cost of more syscalls; acceptable for proxy workloads where connections
 /// are long-lived and latency matters less than memory at 5k+ conns.
 pub const RELAY_BUF_SIZE: usize = 4 * 1024;
+
+/// Grace window granted to the surviving relay direction after the *other*
+/// direction has reached EOF.
+///
+/// Without a bound, a peer that closes one half of the connection and then
+/// holds its read side open forever pins this future — and with it both
+/// underlying sockets. That surfaces as leaked CLOSE-WAIT sockets on the
+/// inbound (client) side (the client sent FIN but meow never `close()`s its
+/// socket) and FIN-WAIT-2 on the outbound side. The reference mihomo kernel
+/// avoids this by tearing the whole relay down once *either* direction
+/// completes; this linger is the equivalent, but lenient: a normal
+/// simultaneous close drains in microseconds — far inside the window — so only
+/// genuinely half-stuck connections are reaped.
+pub const RELAY_HALF_CLOSE_LINGER: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Internal copy-one-direction state (no heap allocation)
@@ -132,11 +147,19 @@ where
     let mut a_done = false;
     let mut b_done = false;
 
-    poll_fn(move |cx| {
-        let a_pin = Pin::new(&mut *a);
-        let b_pin = Pin::new(&mut *b);
+    // Linger timer reaping a half-closed-then-stuck connection. Created up front
+    // so it can be pinned on the stack (no per-relay heap allocation), but not
+    // polled — and therefore not registered with the timer driver — until one
+    // direction has finished and the other is still running. See
+    // `RELAY_HALF_CLOSE_LINGER`.
+    let linger = tokio::time::sleep(RELAY_HALF_CLOSE_LINGER);
+    tokio::pin!(linger);
+    let mut linger_armed = false;
 
+    poll_fn(move |cx| {
         if !a_done {
+            let a_pin = Pin::new(&mut *a);
+            let b_pin = Pin::new(&mut *b);
             match a_to_b.poll_copy(cx, a_pin, b_pin) {
                 Poll::Ready(Ok(_)) => a_done = true,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -144,11 +167,9 @@ where
             }
         }
 
-        // Re-pin after borrowing above.
-        let a_pin = Pin::new(&mut *a);
-        let b_pin = Pin::new(&mut *b);
-
         if !b_done {
+            let a_pin = Pin::new(&mut *a);
+            let b_pin = Pin::new(&mut *b);
             match b_to_a.poll_copy(cx, b_pin, a_pin) {
                 Poll::Ready(Ok(_)) => b_done = true,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -157,10 +178,27 @@ where
         }
 
         if a_done && b_done {
-            Poll::Ready(Ok((a_to_b.amt, b_to_a.amt)))
-        } else {
-            Poll::Pending
+            return Poll::Ready(Ok((a_to_b.amt, b_to_a.amt)));
         }
+
+        // Exactly one direction has finished while the other is still open.
+        // Arm the grace window on that transition, then let it race the
+        // surviving direction: whichever resolves first ends the relay. The
+        // surviving direction is re-polled above on every wake, so if it drains
+        // before the timer fires we still return the full byte counts.
+        if a_done || b_done {
+            if !linger_armed {
+                linger_armed = true;
+                linger
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + RELAY_HALF_CLOSE_LINGER);
+            }
+            if linger.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok((a_to_b.amt, b_to_a.amt)));
+            }
+        }
+
+        Poll::Pending
     })
     .await
 }
@@ -190,6 +228,44 @@ mod tests {
 
         assert_eq!(up, 5, "a→b direction");
         assert_eq!(down, 5, "b→a direction");
+    }
+
+    // Regression: a peer that half-closes (sends EOF on its write side) and
+    // then holds its read side open forever must not pin the relay. Before the
+    // half-close linger, `copy_bidirectional_buf` waited for *both* directions
+    // to EOF, so this hung indefinitely — surfacing in production as leaked
+    // CLOSE-WAIT (inbound) / FIN-WAIT-2 (outbound) sockets.
+    #[tokio::test(start_paused = true)]
+    async fn half_closed_peer_does_not_pin_relay() {
+        use tokio::io::AsyncWriteExt;
+
+        // `a` is the relay's view of the "client": the client sends a byte then
+        // closes its write side, so a→b sees EOF. `b` is the relay's view of the
+        // "upstream", whose far end (`_upstream_held_open`) never sends and never
+        // closes, so b→a would otherwise block forever. The underscore-prefixed
+        // binding is kept (not dropped) for the whole test so `b` never sees EOF.
+        let (mut client, mut a) = duplex(64);
+        let (mut b, _upstream_held_open) = duplex(64);
+
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut buf1 = [0u8; RELAY_BUF_SIZE];
+        let mut buf2 = [0u8; RELAY_BUF_SIZE];
+
+        // With paused time the linger only elapses via the runtime's auto-advance
+        // once the future is genuinely stalled, so completion proves the timer —
+        // not real wall-clock — drove teardown.
+        let (up, down) = tokio::time::timeout(
+            RELAY_HALF_CLOSE_LINGER * 4,
+            copy_bidirectional_buf(&mut a, &mut b, &mut buf1, &mut buf2),
+        )
+        .await
+        .expect("relay must tear down within the linger window, not hang")
+        .expect("relay returns Ok after the linger reaps the stuck direction");
+
+        assert_eq!(up, 1, "the client's byte was relayed before teardown");
+        assert_eq!(down, 0, "upstream never sent anything");
     }
 
     #[tokio::test]
