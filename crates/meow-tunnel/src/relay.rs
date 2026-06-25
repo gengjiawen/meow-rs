@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// are long-lived and latency matters less than memory at 5k+ conns.
 pub const RELAY_BUF_SIZE: usize = 4 * 1024;
 
-/// Grace window granted to the surviving relay direction after the *other*
+/// Idle window granted to the surviving relay direction after the *other*
 /// direction has reached EOF.
 ///
 /// Without a bound, a peer that closes one half of the connection and then
@@ -35,9 +35,15 @@ pub const RELAY_BUF_SIZE: usize = 4 * 1024;
 /// inbound (client) side (the client sent FIN but meow never `close()`s its
 /// socket) and FIN-WAIT-2 on the outbound side. The reference mihomo kernel
 /// avoids this by tearing the whole relay down once *either* direction
-/// completes; this linger is the equivalent, but lenient: a normal
-/// simultaneous close drains in microseconds — far inside the window — so only
-/// genuinely half-stuck connections are reaped.
+/// completes; this linger is the equivalent, but lenient.
+///
+/// The window is an **idle timeout, not an absolute deadline**: it is re-armed
+/// every time the surviving direction transfers more bytes, so a legitimate
+/// half-closed connection that keeps streaming (e.g. a client that shuts down
+/// its write side after a request, then downloads a large response) is never
+/// truncated mid-transfer. Only a connection that goes genuinely silent for the
+/// full window — no progress in either direction — is reaped. A normal
+/// simultaneous close drains in microseconds, far inside the window.
 pub const RELAY_HALF_CLOSE_LINGER: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -155,6 +161,10 @@ where
     let linger = tokio::time::sleep(RELAY_HALF_CLOSE_LINGER);
     tokio::pin!(linger);
     let mut linger_armed = false;
+    // Bytes transferred by the surviving direction when the linger was last
+    // (re)armed. Used to re-arm the idle window on every byte of progress so an
+    // active half-closed transfer is never truncated. See `RELAY_HALF_CLOSE_LINGER`.
+    let mut linger_progress: u64 = 0;
 
     poll_fn(move |cx| {
         if !a_done {
@@ -182,13 +192,18 @@ where
         }
 
         // Exactly one direction has finished while the other is still open.
-        // Arm the grace window on that transition, then let it race the
-        // surviving direction: whichever resolves first ends the relay. The
-        // surviving direction is re-polled above on every wake, so if it drains
-        // before the timer fires we still return the full byte counts.
+        // Arm the idle window on that transition and re-arm it on every byte the
+        // surviving direction makes progress, then let it race that direction:
+        // whichever resolves first ends the relay. Because the window resets on
+        // progress, an actively-streaming half-closed connection is never
+        // truncated — only one that goes silent for the full window is reaped.
+        // The surviving direction is re-polled above on every wake, so if it
+        // drains before the timer fires we still return the full byte counts.
         if a_done || b_done {
-            if !linger_armed {
+            let surviving_amt = if a_done { b_to_a.amt } else { a_to_b.amt };
+            if !linger_armed || surviving_amt != linger_progress {
                 linger_armed = true;
+                linger_progress = surviving_amt;
                 linger
                     .as_mut()
                     .reset(tokio::time::Instant::now() + RELAY_HALF_CLOSE_LINGER);
@@ -266,6 +281,61 @@ mod tests {
 
         assert_eq!(up, 1, "the client's byte was relayed before teardown");
         assert_eq!(down, 0, "upstream never sent anything");
+    }
+
+    // Regression: a legitimate half-closed connection that keeps actively
+    // streaming on the surviving direction must NOT be truncated by the linger.
+    // The client shuts down its write side, then the upstream streams for far
+    // longer than one linger window, with each gap shorter than the window. An
+    // absolute-deadline linger would cut this off at `RELAY_HALF_CLOSE_LINGER`;
+    // the idle-timeout linger re-arms on every chunk and lets it all through.
+    #[tokio::test(start_paused = true)]
+    async fn active_half_closed_transfer_is_not_truncated() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut a) = duplex(64);
+        let (mut b, mut upstream) = duplex(64);
+
+        // Client sends one byte then half-closes — a→b sees EOF, arming the linger.
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // Upstream streams 6 chunks spaced at half the linger window (total span
+        // 3× the window), then closes. No single gap reaches the window, so the
+        // idle timer keeps getting re-armed and never reaps the live transfer.
+        let feeder = tokio::spawn(async move {
+            for _ in 0..6 {
+                tokio::time::sleep(RELAY_HALF_CLOSE_LINGER / 2).await;
+                upstream.write_all(b"yy").await.unwrap();
+            }
+            upstream.shutdown().await.unwrap();
+        });
+
+        let mut buf1 = [0u8; RELAY_BUF_SIZE];
+        let mut buf2 = [0u8; RELAY_BUF_SIZE];
+
+        // Drain `a` (the relay writes upstream bytes here) so the duplex buffer
+        // never backpressures and the relay can run to upstream's clean EOF.
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut sink = Vec::new();
+            client.read_to_end(&mut sink).await.unwrap();
+            sink.len()
+        });
+
+        let (up, down) = copy_bidirectional_buf(&mut a, &mut b, &mut buf1, &mut buf2)
+            .await
+            .expect("relay completes via upstream EOF, not a truncating linger");
+
+        feeder.await.unwrap();
+        let drained = drain.await.unwrap();
+
+        assert_eq!(up, 1, "the client's byte was relayed");
+        assert_eq!(
+            down, 12,
+            "every upstream byte must be relayed — the active transfer is not truncated"
+        );
+        assert_eq!(drained, 12, "client received the full upstream stream");
     }
 
     #[tokio::test]
