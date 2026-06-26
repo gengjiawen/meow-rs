@@ -20,7 +20,7 @@ use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "meow";
@@ -509,6 +509,36 @@ async fn run(
 
     // Start REST API if configured
     if let Some(api_addr) = config.api.external_controller {
+        // `external-ui-url` auto-download is gated behind the optional
+        // `external-ui-download` feature (it pulls in the `zip` crate, against
+        // the ADR-0007 size caps). Without the feature we just hint the user to
+        // populate the directory manually. See issue #223.
+        if let (Some(url), Some(dir)) = (&config.api.external_ui_url, &config.api.external_ui) {
+            if !dir.is_dir() {
+                // Auto-download is gated behind `external-ui-download` AND is
+                // force-disabled on iOS/Android (mobile ships its own UI).
+                #[cfg(all(
+                    feature = "external-ui-download",
+                    not(any(target_os = "ios", target_os = "android"))
+                ))]
+                {
+                    if let Err(e) = meow_config::external_ui::download_external_ui(url, dir).await {
+                        warn!("failed to download external-ui from {url}: {e:#}");
+                    }
+                }
+                #[cfg(not(all(
+                    feature = "external-ui-download",
+                    not(any(target_os = "ios", target_os = "android"))
+                )))]
+                {
+                    warn!(
+                        "external-ui-url ({url}) is set but auto-download is unavailable in this \
+                         build; download and extract the UI into {} manually",
+                        dir.display()
+                    );
+                }
+            }
+        }
         let api_server = ApiServer::new(
             tunnel.clone(),
             api_addr,
@@ -519,6 +549,7 @@ async fn run(
             Arc::clone(&proxy_providers),
             Arc::clone(&rule_providers),
             config.listeners.named.clone(),
+            config.api.external_ui.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = api_server.run().await {
