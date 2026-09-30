@@ -48,6 +48,7 @@ pub fn spawn_vmess_relay(
     // marks a fatal end (handshake failure, decode error, transport error,
     // or the client endpoint gone), where the write side is stopped too.
     let read_task = tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(BodyCipher::max_plaintext() + crate::aead::TAG_LEN);
         if let Err(e) =
             read_aead_response_header(&mut rd, &resp_body_key, &resp_body_iv, resp_v).await
         {
@@ -57,9 +58,9 @@ pub fn spawn_vmess_relay(
         }
 
         let clean_eof = loop {
-            match read_cipher.read_record(&mut rd).await {
-                Ok(Some(plaintext)) => {
-                    if proxy_wr.write_all(&plaintext).await.is_err() {
+            match read_cipher.read_record_into(&mut rd, &mut buf).await {
+                Ok(Some(())) => {
+                    if proxy_wr.write_all(&buf).await.is_err() {
                         break false;
                     }
                 }

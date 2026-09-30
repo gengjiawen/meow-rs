@@ -330,10 +330,26 @@ impl Aead {
     }
 
     /// Seal with the auto-incrementing counter and associated data (record header).
+    #[cfg(test)]
     pub(crate) fn seal_ad(&mut self, plaintext: &[u8], ad: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
+        self.seal_ad_append(plaintext, ad, &mut out);
+        out
+    }
+
+    /// Seal with the auto-incrementing counter and append ciphertext plus tag
+    /// to a caller-owned buffer. The record relay reuses that buffer across
+    /// chunks, avoiding a plaintext → sealed → output copy for every record.
+    pub(crate) fn seal_ad_append(&mut self, plaintext: &[u8], ad: &[u8], out: &mut Vec<u8>) {
         self.increment_nonce();
         let nonce = self.nonce;
-        self.encrypt(&nonce, plaintext, ad)
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        out.resize(start + plaintext.len() + TAG_LEN, 0);
+        let (data, tag) = out[start..].split_at_mut(plaintext.len());
+        self.cipher
+            .seal_detached(&nonce, ad, data, tag)
+            .expect("AEAD seal is infallible for valid inputs");
     }
 
     /// Seal with the explicit all-`0xFF` nonce (counter untouched).
@@ -354,10 +370,23 @@ impl Aead {
     }
 
     /// Open with the auto-incrementing counter and associated data (record header).
+    #[cfg(test)]
     pub(crate) fn open_ad(&mut self, ct: &[u8], ad: &[u8]) -> Result<Vec<u8>, AeadError> {
         self.increment_nonce();
         let nonce = self.nonce;
         self.decrypt(&nonce, ct, ad)
+    }
+
+    /// Open an associated-data record in place, removing its trailing tag.
+    /// This is the read-side counterpart to [`Self::seal_ad_append`].
+    pub(crate) fn open_ad_in_place(
+        &mut self,
+        ct: &mut Vec<u8>,
+        ad: &[u8],
+    ) -> Result<(), AeadError> {
+        self.increment_nonce();
+        let nonce = self.nonce;
+        self.cipher.open_trailing(&nonce, ad, ct)
     }
 
     /// Open with the explicit all-`0xFF` nonce (counter untouched).
@@ -583,9 +612,12 @@ mod tests {
         for use_aes in [true, false] {
             let mut enc = Aead::new(b"iv", b"key", use_aes);
             let mut dec = Aead::new(b"iv", b"key", use_aes);
-            let ct = enc.seal_ad(b"hello world", b"\x17\x03\x03\x00\x1b");
-            let pt = dec.open_ad(&ct, b"\x17\x03\x03\x00\x1b").unwrap();
-            assert_eq!(pt, b"hello world");
+            let header = b"\x17\x03\x03\x00\x1b";
+            let mut out = b"prefix".to_vec();
+            enc.seal_ad_append(b"hello world", header, &mut out);
+            let mut ct = out.split_off(b"prefix".len());
+            dec.open_ad_in_place(&mut ct, header).unwrap();
+            assert_eq!(ct, b"hello world");
         }
     }
 

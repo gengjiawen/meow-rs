@@ -28,6 +28,8 @@ use ctr::cipher::StreamCipher;
 const RELAY_BUF: usize = 32 * 1024;
 /// Maximum plaintext bytes per record (`common.go`: `if len(b) > 8192`).
 const MAX_CHUNK: usize = 8192;
+/// Maximum accepted encrypted record body (`decode_header`).
+const MAX_RECORD_BODY: usize = 16_640;
 
 /// A parsed long-term "NFS" public key from the `encryption` config string.
 enum NfsKey {
@@ -501,6 +503,7 @@ async fn read_loop(
     }
 
     let mut clean_eof = false;
+    let mut data = Vec::with_capacity(MAX_RECORD_BODY);
     loop {
         // Two-phase header read: a bare `read` returning 0 means FIN at a
         // record boundary — the clean half-close. `read_exact` alone cannot
@@ -545,7 +548,7 @@ async fn read_loop(
             }
             break;
         };
-        let mut data = vec![0u8; l];
+        data.resize(l, 0);
         if let Err(e) = rd.read_exact(&mut data).await {
             tracing::warn!("vless encryption: record body truncated: {e}");
             break;
@@ -556,7 +559,7 @@ async fn read_loop(
             ctx.extend_from_slice(&data);
             Aead::new(&ctx, &united_key, use_aes)
         });
-        let Ok(plain) = peer_aead.open_ad(&data, &hdr) else {
+        let Ok(()) = peer_aead.open_ad_in_place(&mut data, &hdr) else {
             if first_record_ok {
                 tracing::warn!("vless encryption: record authentication failed");
             } else {
@@ -572,7 +575,7 @@ async fn read_loop(
         if let Some(next) = rekey {
             peer_aead = next;
         }
-        if proxy_wr.write_all(&plain).await.is_err() {
+        if proxy_wr.write_all(&data).await.is_err() {
             break;
         }
     }
@@ -586,11 +589,13 @@ async fn write_loop(
     mut proxy_rd: ReadHalf<DuplexStream>,
     mut aead: Aead,
     mut write_ctr: Option<Aes256Ctr>,
-    mut pre_write: Vec<u8>,
+    pre_write: Vec<u8>,
     united_key: Vec<u8>,
     use_aes: bool,
 ) {
     let mut buf = vec![0u8; MAX_CHUNK];
+    let mut out = Vec::with_capacity(pre_write.len() + 5 + MAX_CHUNK + TAG_LEN);
+    let mut first_record = true;
     loop {
         let n = match proxy_rd.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -598,25 +603,25 @@ async fn write_loop(
         };
         let body = &buf[..n];
 
-        let mut header = encode_header(body.len() + TAG_LEN);
+        let header = encode_header(body.len() + TAG_LEN);
         let exhausted = aead.is_exhausted();
-        let sealed = aead.seal_ad(body, &header);
+        out.clear();
+        if first_record {
+            out.extend_from_slice(&pre_write);
+            first_record = false;
+        }
+        let header_start = out.len();
+        out.extend_from_slice(&header);
+        aead.seal_ad_append(body, &header, &mut out);
         if exhausted {
-            let mut ctx = Vec::with_capacity(5 + sealed.len());
-            ctx.extend_from_slice(&header);
-            ctx.extend_from_slice(&sealed);
+            let mut ctx = Vec::with_capacity(out.len() - header_start);
+            ctx.extend_from_slice(&out[header_start..]);
             aead = Aead::new(&ctx, &united_key, use_aes);
         }
         if let Some(ctr) = write_ctr.as_mut() {
-            ctr.apply_keystream(&mut header);
+            ctr.apply_keystream(&mut out[header_start..header_start + 5]);
         }
 
-        let mut out = Vec::with_capacity(pre_write.len() + 5 + sealed.len());
-        if !pre_write.is_empty() {
-            out.append(&mut pre_write);
-        }
-        out.extend_from_slice(&header);
-        out.extend_from_slice(&sealed);
         if wr.write_all(&out).await.is_err() {
             break;
         }

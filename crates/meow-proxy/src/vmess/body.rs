@@ -141,6 +141,9 @@ pub struct BodyCipher {
     read_iv: [u8; 16],
     write_counter: u32,
     read_counter: u32,
+    /// Reused by the write direction so every record does not allocate a
+    /// fresh frame buffer.
+    write_buf: Vec<u8>,
 }
 
 /// Number of distinct nonces a u16 counter can produce. Mux logical flows
@@ -173,6 +176,7 @@ impl BodyCipher {
             read_iv: r.read_iv,
             write_counter: 0,
             read_counter: 0,
+            write_buf: w.write_buf,
         }
     }
 
@@ -189,6 +193,7 @@ impl BodyCipher {
             read_iv: [0; 16],
             write_counter: 0,
             read_counter: 0,
+            write_buf: Vec::new(),
         }
     }
 
@@ -218,6 +223,7 @@ impl BodyCipher {
             read_iv: *resp_iv,
             write_counter: 0,
             read_counter: 0,
+            write_buf: Vec::new(),
         }
     }
 
@@ -293,13 +299,15 @@ impl BodyCipher {
         let len = u16::try_from(plaintext.len() + TAG_LEN)
             .map_err(|_| std::io::Error::other("vmess body record too large"))?;
         let nonce = self.write_nonce()?;
-        let mut frame = Vec::with_capacity(2 + usize::from(len));
+        let frame = &mut self.write_buf;
+        frame.clear();
+        frame.reserve(2 + usize::from(len));
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(plaintext);
         frame.resize(2 + usize::from(len), 0);
         let (data, tag) = frame[2..].split_at_mut(plaintext.len());
         self.write.seal(&nonce, data, tag)?;
-        writer.write_all(&frame).await?;
+        writer.write_all(frame).await?;
         writer.flush().await
     }
 
@@ -312,10 +320,28 @@ impl BodyCipher {
     /// decrypt failure, nonce-budget exhaustion, transport error — means a
     /// corrupt session and is fatal for the exchange: a truncated AEAD
     /// record must not be mistaken for a half-close (issue #514 review).
+    #[cfg(test)]
     pub async fn read_record<R: AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
     ) -> std::io::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        match self.read_record_into(reader, &mut buf).await? {
+            Some(()) => Ok(Some(buf)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read and decrypt one body record into a caller-owned buffer.
+    ///
+    /// The relay keeps this buffer across records, avoiding one allocation for
+    /// every encrypted chunk. `Some(())` means `buf` contains a record;
+    /// `None` is the clean close or explicit terminator.
+    pub async fn read_record_into<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+    ) -> std::io::Result<Option<()>> {
         // Two-phase length-prefix read: a bare `read` returning 0 is FIN
         // at a record boundary; `read_exact` alone cannot tell that apart
         // from a FIN arriving after part of the prefix already landed
@@ -328,6 +354,7 @@ impl BodyCipher {
                 "vmess body: read direction not built (writer cipher)",
             ));
         }
+        buf.clear();
         let mut len_buf = [0u8; 2];
         match reader.read(&mut len_buf).await {
             Ok(0) => return Ok(None),
@@ -343,16 +370,16 @@ impl BodyCipher {
         }
 
         if matches!(self.read, RecordCipher::None) {
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
-            return Ok(Some(buf));
+            buf.resize(len, 0);
+            reader.read_exact(buf).await?;
+            return Ok(Some(()));
         }
 
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf).await?;
+        buf.resize(len, 0);
+        reader.read_exact(buf).await?;
         let nonce = self.read_nonce()?;
-        self.read.open(&nonce, &mut buf)?;
-        Ok(Some(buf))
+        self.read.open(&nonce, buf)?;
+        Ok(Some(()))
     }
 
     pub fn max_plaintext() -> usize {
@@ -498,10 +525,15 @@ mod tests {
 
             let mut reader = BodyCipher::loopback(security, &req_key, &req_iv);
             let mut cursor = std::io::Cursor::new(wire);
+            let mut output = Vec::with_capacity(64);
             assert_eq!(
-                reader.read_record(&mut cursor).await.unwrap().as_deref(),
-                Some(plaintext.as_slice())
+                reader
+                    .read_record_into(&mut cursor, &mut output)
+                    .await
+                    .unwrap(),
+                Some(())
             );
+            assert_eq!(output, plaintext);
         }
     }
 
