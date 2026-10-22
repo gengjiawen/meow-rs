@@ -8,6 +8,13 @@ A high-performance Rust implementation of the [mihomo](https://github.com/MetaCu
 
 Beyond mihomo, meow keeps [`dialer-proxy` chains](#dialer-proxy-chains) working when a member of the dialer group can pass its URL test but not reach the chained server, and keeps a [logbook](#logbook) of what the engine did (reloads, provider failures, crashes, chained nodes going down) that survives restarts.
 
+## Apps
+
+meow-rs is the engine of the meow apps:
+
+- **Android** -- [meow-android](https://github.com/meow-rs/meow-android): [Google Play](https://play.google.com/store/apps/details?id=io.github.madeye.meow), [GitHub Releases](https://github.com/meow-rs/meow-android/releases/latest)
+- **iOS, iPadOS and Apple TV** -- [meow-ios](https://github.com/meow-rs/meow-ios): [App Store](https://apps.apple.com/us/app/meow-smart-vpn/id6778303404), [TestFlight public beta](https://testflight.apple.com/join/HSptQN3h)
+
 ## Features
 
 ### Proxy Protocols
