@@ -199,6 +199,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_proxy).put(update_proxy).delete(unfix_proxy),
         )
         .route("/proxies/{name}/delay", get(get_proxy_delay))
+        .route("/proxies/{name}/chain-health", get(get_chain_health))
         .route("/group", get(get_groups))
         .route("/group/{name}", get(get_group))
         .route("/group/{name}/delay", get(get_group_delay))
@@ -2567,7 +2568,7 @@ struct DelayResp {
 }
 
 /// `{"message": "..."}` body matching upstream's error render.
-fn msg_err(status: StatusCode, message: &'static str) -> Response {
+fn msg_err(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "message": message }))).into_response()
 }
 
@@ -2711,6 +2712,126 @@ async fn get_group_delay(
         return msg_err(StatusCode::GATEWAY_TIMEOUT, "Timeout");
     }
     Json(result).into_response()
+}
+
+#[derive(Deserialize)]
+struct ChainHealthParams {
+    dialer: Option<String>,
+}
+
+/// `GET /proxies/{name}/chain-health`: what [`diagnose_chain`] finds for
+/// each member of `dialer`.
+///
+/// [`diagnose_chain`]: meow_proxy::health::diagnose_chain
+#[derive(Serialize)]
+struct ChainHealthResp {
+    proxy: String,
+    server: String,
+    dialer: String,
+    members: Vec<ChainHealthMember>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ChainHealthMember {
+    name: String,
+    verdict: &'static str,
+    /// Through the chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delay: Option<u16>,
+    /// The member alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_delay: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+impl From<meow_proxy::health::MemberDiagnosis> for ChainHealthMember {
+    fn from(found: meow_proxy::health::MemberDiagnosis) -> Self {
+        use meow_proxy::health::ChainDiagnosis as D;
+        let (verdict, delay, member_delay, reason) = match found.diagnosis {
+            D::Reached {
+                delay,
+                member_delay,
+            } => ("reached", Some(delay), member_delay, None),
+            D::Failed {
+                member_delay,
+                reason,
+            } => ("failed", None, Some(member_delay), Some(reason)),
+            D::Inconclusive {
+                member_delay,
+                reason,
+            } => ("inconclusive", None, Some(member_delay), Some(reason)),
+            D::Down { reason } => ("down", None, None, Some(reason)),
+            D::Skipped { reason } => ("skipped", None, None, Some(reason)),
+        };
+        Self {
+            name: found.name,
+            verdict,
+            delay,
+            member_delay,
+            reason,
+        }
+    }
+}
+
+/// Probe proxy `name` as a chained outbound through each member of
+/// `dialer`, a group or a single proxy, whether or not `name` sets a
+/// `dialer-proxy`. A meow extension: mihomo has no such route. Records
+/// nothing, so it is safe to run against the live config.
+async fn get_chain_health(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<DelayParams>,
+    Query(ChainHealthParams { dialer }): Query<ChainHealthParams>,
+) -> Response {
+    use meow_proxy::health::{diagnose_chain, ChainDiagnosisError};
+
+    let timeout = match parse_delay_params(&params) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    let Some(dialer) = dialer.filter(|d| !d.is_empty()) else {
+        return msg_err(StatusCode::BAD_REQUEST, "Body invalid");
+    };
+    let url = params.url.as_deref().unwrap_or("").trim();
+
+    // Held across the probes, as in `get_proxy_delay` (issue #533).
+    let route = state.tunnel.route_snapshot();
+    let Some((owner, _)) = find_proxy(&state, &route.proxies, &name) else {
+        return msg_err(StatusCode::NOT_FOUND, &format!("no proxy named '{name}'"));
+    };
+    let Some((front, _)) = find_proxy(&state, &route.proxies, &dialer) else {
+        return msg_err(
+            StatusCode::NOT_FOUND,
+            &format!("no proxy or group named '{dialer}'"),
+        );
+    };
+    let members = front
+        .member_proxies()
+        .unwrap_or_else(|| vec![Arc::clone(&front)]);
+
+    match diagnose_chain(&owner, &members, url, params.expected.as_deref(), timeout).await {
+        Ok(found) => Json(ChainHealthResp {
+            proxy: name,
+            server: owner.addr().to_string(),
+            dialer,
+            members: found.into_iter().map(ChainHealthMember::from).collect(),
+        })
+        .into_response(),
+        Err(ChainDiagnosisError::Group) => msg_err(
+            StatusCode::BAD_REQUEST,
+            &format!("'{name}' is a group; name one of its proxies"),
+        ),
+        Err(ChainDiagnosisError::NoServer) => msg_err(
+            StatusCode::BAD_REQUEST,
+            &format!("'{name}' has no server to dial through '{dialer}'"),
+        ),
+        Err(ChainDiagnosisError::Unsupported) => msg_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("'{name}' cannot run over another proxy's stream, so it cannot be chained"),
+        ),
+    }
 }
 
 // ── Config reload (M1.G-10) ──────────────────────────────────────────

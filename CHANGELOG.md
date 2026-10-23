@@ -34,6 +34,19 @@ the canonical, in-repo source a release is cut from.
   teaches a coding agent to use it, including which commands change state;
   `meow-cli skill` prints its `SKILL.md`. The crate is not published on crates.io,
   where the name belongs to an unrelated crate.
+- **Chain health checks for `dialer-proxy` chains**: `meow-cli chain-health
+  <proxy> <dialer>` and `GET /proxies/{name}/chain-health?dialer=…` dial a
+  proxy through each member of a group, the way `dialer-proxy` chains it,
+  whether or not its config sets one, and probe each member alone too. A
+  member that works on its own but cannot carry the proxy, like an airport
+  node that blocks the proxy's server, reads `failed`, apart from members
+  that are `down`; `reached` gives the chain's delay. When no member carries
+  the proxy, the members that work alone read `inconclusive`, as the
+  proxy's own server is the likelier fault. Groups and the proxy itself are
+  `skipped`. The check records nothing: no delay, no chain verdict, no
+  logbook entry. `--json` prints each member's verdict for scripts that
+  prune a front group. A proxy that cannot run over another proxy's
+  stream, like hysteria2, is refused (422).
 
 ### Changed
 

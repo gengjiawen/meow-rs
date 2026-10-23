@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
+use futures::{future::BoxFuture, FutureExt, Stream, StreamExt, TryStreamExt};
 use meow_common::logbook::{self, Level};
 use meow_common::{
     failure_reason, AdapterType, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy,
@@ -605,6 +605,168 @@ async fn check_chain(round: &ChainRound<'_>, owner: &str, reason: &'static str) 
         .coalesce()
         .record();
     0
+}
+
+/// What [`diagnose_chain`] found for one member: whether it can carry a
+/// chained outbound to its server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainDiagnosis {
+    /// The chain through the member reached the URL in `delay` ms.
+    /// `member_delay` is the member's own probe, `None` when that failed.
+    Reached {
+        delay: u16,
+        member_delay: Option<u16>,
+    },
+    /// The member reaches the URL on its own, and another member carried
+    /// the chain, but not this one: it cannot carry the chain, the mark of
+    /// a front that audits the outbound's server.
+    Failed {
+        member_delay: u16,
+        reason: &'static str,
+    },
+    /// The member reaches the URL on its own but not the chain, and no
+    /// member carried the chain: the outbound's server is the likelier
+    /// fault, so this says nothing about the member.
+    Inconclusive {
+        member_delay: u16,
+        reason: &'static str,
+    },
+    /// Neither the chain nor the member alone reached the URL: whether it
+    /// can carry the chain is unknown.
+    Down { reason: &'static str },
+    /// Not probed: the member is a group, or the outbound itself.
+    Skipped { reason: &'static str },
+}
+
+/// One member's [`ChainDiagnosis`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDiagnosis {
+    pub name: String,
+    pub diagnosis: ChainDiagnosis,
+}
+
+/// Why [`diagnose_chain`] probed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainDiagnosisError {
+    /// The outbound is a group, not a proxy.
+    Group,
+    /// The outbound has no server to dial, like DIRECT.
+    NoServer,
+    /// The outbound cannot run over a relayed stream, like hysteria2. This
+    /// shows once a member reaches its server: while none does, the
+    /// members read as [`ChainDiagnosis::Down`] or
+    /// [`ChainDiagnosis::Inconclusive`].
+    Unsupported,
+}
+
+/// Probe `owner` as a chained outbound through each of `members`, the
+/// front hop forced to that member whether or not `owner` sets a
+/// `dialer-proxy`: `[member, owner]` to `url`, and the member alone, both
+/// over fresh connections. Results keep the order of `members`, probed
+/// [`GROUP_DELAY_CONCURRENCY`] at a time.
+///
+/// A diagnosis only: no delay, chain verdict or logbook entry is recorded,
+/// and `owner` is never registered anywhere.
+pub async fn diagnose_chain(
+    owner: &Arc<dyn Proxy>,
+    members: &[Arc<dyn Proxy>],
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<MemberDiagnosis>, ChainDiagnosisError> {
+    if owner.member_proxies().is_some() {
+        return Err(ChainDiagnosisError::Group);
+    }
+    if ChainTarget::from_server_addr(owner.addr()).is_none() {
+        return Err(ChainDiagnosisError::NoServer);
+    }
+    let probes: Vec<_> = members
+        .iter()
+        .map(|member| diagnose_member(owner, member, url, expected, timeout))
+        .collect();
+    let mut found: Vec<MemberDiagnosis> = futures::stream::iter(probes)
+        .buffered(GROUP_DELAY_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let reached = found
+        .iter()
+        .any(|m| matches!(m.diagnosis, ChainDiagnosis::Reached { .. }));
+    if !reached {
+        for member in &mut found {
+            if let ChainDiagnosis::Failed {
+                member_delay,
+                reason,
+            } = member.diagnosis
+            {
+                member.diagnosis = ChainDiagnosis::Inconclusive {
+                    member_delay,
+                    reason,
+                };
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// [`diagnose_chain`] for one member. A member that fails the chain is
+/// [`ChainDiagnosis::Failed`] until the caller sees whether any reached.
+async fn diagnose_member(
+    owner: &Arc<dyn Proxy>,
+    member: &Arc<dyn Proxy>,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+) -> Result<MemberDiagnosis, ChainDiagnosisError> {
+    let name = member.name().to_owned();
+    let skipped = if member.member_proxies().is_some() {
+        Some("a group")
+    } else if member.name() == owner.name() {
+        Some("the proxy itself")
+    } else {
+        None
+    };
+    if let Some(reason) = skipped {
+        return Ok(MemberDiagnosis {
+            name,
+            diagnosis: ChainDiagnosis::Skipped { reason },
+        });
+    }
+    let probe = ChainProbe::new(member, owner);
+    let (chain, alone) = tokio::join!(
+        limited_url_test(&probe, url, expected, timeout),
+        limited_url_test(member.as_ref(), url, expected, timeout),
+    );
+    if probe.unsupported.load(Ordering::Relaxed) {
+        return Err(ChainDiagnosisError::Unsupported);
+    }
+    let diagnosis = match (chain, alone) {
+        (Ok(delay), alone) => ChainDiagnosis::Reached {
+            delay,
+            member_delay: alone.ok(),
+        },
+        (Err(error), Ok(member_delay)) => ChainDiagnosis::Failed {
+            member_delay,
+            reason: url_test_reason(&error),
+        },
+        (Err(_), Err(error)) => ChainDiagnosis::Down {
+            reason: url_test_reason(&error),
+        },
+    };
+    Ok(MemberDiagnosis { name, diagnosis })
+}
+
+/// [`url_test`] under the global probe limit, recording nothing.
+async fn limited_url_test(
+    adapter: &dyn ProxyAdapter,
+    url: &str,
+    expected: Option<&str>,
+    timeout: Duration,
+) -> Result<u16, UrlTestError> {
+    let _permit = global_delay_probe_limiter()
+        .acquire()
+        .await
+        .expect("global delay probe semaphore is never closed");
+    url_test(adapter, url, expected, timeout).await
 }
 
 /// `'a', 'b', 'c'`.
@@ -1483,6 +1645,173 @@ mod tests {
             assert_eq!(swept.delay, 0);
             assert!(!member.alive());
             assert_eq!(audited.dials(), 1);
+        }
+    }
+
+    mod diagnose {
+        use super::*;
+        use crate::group::test_support::StreamProxy;
+        use meow_common::chain_health::CLOSED_BEFORE_REPLY;
+
+        const URL: &str = "http://probe.example/generate_204";
+
+        fn daniel() -> Arc<dyn Proxy> {
+            StreamProxy::new("daniel", "snell.example.com:8443")
+        }
+
+        async fn diagnose(
+            owner: &Arc<dyn Proxy>,
+            members: &[Arc<dyn Proxy>],
+        ) -> Result<Vec<MemberDiagnosis>, ChainDiagnosisError> {
+            diagnose_chain(owner, members, URL, None, Duration::from_millis(300)).await
+        }
+
+        /// Each member gets its own verdict, in the group's order: the
+        /// audited one fails the chain while working alone, the one that
+        /// fails alone is down, and groups and the outbound itself are not
+        /// probed. Nothing is recorded.
+        #[tokio::test]
+        async fn tells_audited_members_from_clean_and_down_ones() {
+            let clean = StreamProxy::new("HK-01", "10.0.0.1:443");
+            let audited = StreamProxy::auditing("SG-01", "10.0.0.2:443", 8443);
+            let down = StreamProxy::hanging("JP-01", "10.0.0.3:443");
+            // Closes the probe URL's port only: it carries the chain.
+            let lone = StreamProxy::auditing("US-01", "10.0.0.4:443", 80);
+            let group: Arc<dyn Proxy> = Arc::new(crate::group::selector::SelectorGroup::new(
+                "Auto",
+                vec![Arc::clone(&clean) as _],
+            ));
+            let owner = daniel();
+            let members: Vec<Arc<dyn Proxy>> = vec![
+                Arc::clone(&clean) as _,
+                Arc::clone(&audited) as _,
+                Arc::clone(&down) as _,
+                Arc::clone(&lone) as _,
+                group,
+                Arc::clone(&owner),
+            ];
+
+            let found = diagnose(&owner, &members).await.unwrap();
+            let names: Vec<&str> = found.iter().map(|m| m.name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["HK-01", "SG-01", "JP-01", "US-01", "Auto", "daniel"]
+            );
+            let diagnoses: Vec<ChainDiagnosis> = found.iter().map(|m| m.diagnosis).collect();
+            assert!(
+                matches!(
+                    diagnoses[0],
+                    ChainDiagnosis::Reached {
+                        delay: 1..,
+                        member_delay: Some(1..)
+                    }
+                ),
+                "{diagnoses:?}"
+            );
+            assert!(
+                matches!(
+                    diagnoses[1],
+                    ChainDiagnosis::Failed {
+                        member_delay: 1..,
+                        reason: CLOSED_BEFORE_REPLY
+                    }
+                ),
+                "{diagnoses:?}"
+            );
+            assert_eq!(
+                diagnoses[2],
+                ChainDiagnosis::Down {
+                    reason: "timed out"
+                }
+            );
+            assert!(
+                matches!(
+                    diagnoses[3],
+                    ChainDiagnosis::Reached {
+                        member_delay: None,
+                        ..
+                    }
+                ),
+                "{diagnoses:?}"
+            );
+            assert_eq!(
+                diagnoses[4..],
+                [
+                    ChainDiagnosis::Skipped { reason: "a group" },
+                    ChainDiagnosis::Skipped {
+                        reason: "the proxy itself"
+                    },
+                ]
+            );
+
+            // Each probed member was dialled twice, alone and as the front
+            // hop, and kept no delay or verdict.
+            let members = [&clean, &audited, &down, &lone];
+            for member in members {
+                assert_eq!(member.dials(), 2, "{}", member.name());
+                assert_eq!(member.last_delay(), 0, "{}", member.name());
+                assert!(member.alive(), "{}", member.name());
+            }
+            assert_eq!(owner.last_delay(), 0);
+            assert!(owner.alive());
+        }
+
+        /// When no member carries the chain, the outbound's server is the
+        /// likelier fault: members that work alone are inconclusive, not
+        /// failed.
+        #[tokio::test]
+        async fn no_member_reaching_the_server_fails_none() {
+            let members: Vec<Arc<dyn Proxy>> = vec![
+                StreamProxy::auditing("SG-01", "10.0.0.1:443", 8443),
+                StreamProxy::auditing("SG-02", "10.0.0.2:443", 8443),
+                StreamProxy::hanging("JP-01", "10.0.0.3:443"),
+            ];
+            let found = diagnose(&daniel(), &members).await.unwrap();
+            let diagnoses: Vec<ChainDiagnosis> = found.iter().map(|m| m.diagnosis).collect();
+            assert!(
+                matches!(
+                    diagnoses[..],
+                    [
+                        ChainDiagnosis::Inconclusive {
+                            reason: CLOSED_BEFORE_REPLY,
+                            ..
+                        },
+                        ChainDiagnosis::Inconclusive {
+                            reason: CLOSED_BEFORE_REPLY,
+                            ..
+                        },
+                        ChainDiagnosis::Down {
+                            reason: "timed out"
+                        },
+                    ]
+                ),
+                "{diagnoses:?}"
+            );
+        }
+
+        /// An outbound that cannot run over a relayed stream, a group, and
+        /// one with no server are refused whole.
+        #[tokio::test]
+        async fn refuses_outbounds_it_cannot_chain() {
+            let members: Vec<Arc<dyn Proxy>> = vec![StreamProxy::new("HK-01", "10.0.0.1:443")];
+            let hy2: Arc<dyn Proxy> = StreamProxy::without_relay("hy2", "hy2.example.com:8443");
+            assert_eq!(
+                diagnose(&hy2, &members).await,
+                Err(ChainDiagnosisError::Unsupported)
+            );
+            let group: Arc<dyn Proxy> = Arc::new(crate::group::selector::SelectorGroup::new(
+                "Auto",
+                members.clone(),
+            ));
+            assert_eq!(
+                diagnose(&group, &members).await,
+                Err(ChainDiagnosisError::Group)
+            );
+            let serverless: Arc<dyn Proxy> = StreamProxy::new("DIRECT", "");
+            assert_eq!(
+                diagnose(&serverless, &members).await,
+                Err(ChainDiagnosisError::NoServer)
+            );
         }
     }
 }

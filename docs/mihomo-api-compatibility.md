@@ -71,6 +71,10 @@ The following routes are retained and do not collide with the mihomo surface:
   proxy-provider node by name, where mihomo returns 404. A route-table entry
   wins over a provider node of the same name; between providers, the first
   by provider name wins. The provider route reaches any one of them
+- `GET /proxies/{name}/chain-health?dialer=…`: probes proxy `name` chained
+  through each member of `dialer`, and each member alone, recording
+  nothing; a verdict per member (`reached`, `failed`, `inconclusive`,
+  `down`, `skipped`). See the REST API reference
 - `/api/subscriptions/*`
 - `/api/proxy-groups/*`
 - `/api/config/save`

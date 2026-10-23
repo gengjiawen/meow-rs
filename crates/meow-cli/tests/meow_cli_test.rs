@@ -16,7 +16,7 @@ use meow_dns::Resolver;
 use meow_trie::DomainTrie;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 
@@ -48,7 +48,11 @@ struct Meow {
 
 impl Meow {
     async fn start() -> Self {
-        let raw = meow_config::parse_raw_yaml(CONFIG).unwrap();
+        Self::start_with(CONFIG).await
+    }
+
+    async fn start_with(config: &str) -> Self {
+        let raw = meow_config::parse_raw_yaml(config).unwrap();
         let resolver = Arc::new(Resolver::new(
             vec!["8.8.8.8:53".parse().unwrap()],
             vec![],
@@ -475,4 +479,168 @@ async fn the_skill_prints_itself() {
     // `lines()`: a Windows checkout may turn the file's newlines into CRLF.
     let head: Vec<&str> = text.lines().take(2).collect();
     assert_eq!(head, ["---", "name: meow-cli"]);
+}
+
+/// Reads a request head off `stream`: the text up to its blank line.
+async fn read_head(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream.read(&mut buf).await.ok().filter(|&n| n > 0)?;
+        head.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8(head).ok()
+}
+
+/// An HTTP server that answers every request with a 204.
+async fn origin() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if read_head(&mut stream).await.is_some() {
+                    let reply = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(reply).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// An HTTP CONNECT proxy. It closes every tunnel to port `blocks` without
+/// a reply, as a node that audits that server does.
+async fn connect_proxy(blocks: Option<u16>) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Some(head) = read_head(&mut stream).await else {
+                    return;
+                };
+                let Some(target) = head
+                    .strip_prefix("CONNECT ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                else {
+                    return;
+                };
+                let port = target.rsplit_once(':').and_then(|(_, p)| p.parse().ok());
+                if port.is_some() && port == blocks {
+                    return;
+                }
+                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                    let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                    return;
+                };
+                let established = b"HTTP/1.1 200 Connection established\r\n\r\n";
+                if stream.write_all(established).await.is_ok() {
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// `daniel`, an HTTP proxy, chained through each member of `third-fast`:
+/// real proxies over loopback, the probe fetching from a local server.
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_health_tells_which_members_carry_a_proxy() {
+    let origin = origin().await;
+    let daniel = connect_proxy(None).await;
+    let clean = connect_proxy(None).await;
+    let audited = connect_proxy(Some(daniel.port())).await;
+    // A port nothing listens on: bind one, then free it.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let config = format!(
+        r#"
+mode: rule
+proxies:
+  - {{name: daniel, type: http, server: 127.0.0.1, port: {}}}
+  - {{name: clean, type: http, server: 127.0.0.1, port: {}}}
+  - {{name: audited, type: http, server: 127.0.0.1, port: {}}}
+  - {{name: dead, type: http, server: 127.0.0.1, port: {dead_port}}}
+proxy-groups:
+  - name: Auto
+    type: select
+    proxies: [DIRECT]
+  - name: third-fast
+    type: select
+    proxies: [dead, audited, Auto, daniel, clean]
+rules:
+  - MATCH,DIRECT
+"#,
+        daniel.port(),
+        clean.port(),
+        audited.port(),
+    );
+    let meow = Meow::start_with(&config).await;
+    let url = format!("http://{origin}/generate_204");
+    let args = [
+        "chain-health",
+        "daniel",
+        "third-fast",
+        "--url",
+        &url,
+        "--probe-timeout",
+        "3000",
+    ];
+
+    // Carriers first, then the members that cannot carry it.
+    let text = meow.run(&args).await;
+    let rows: Vec<(&str, &str)> = text
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            (words[0], *words.last().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("reached", "clean"),
+            ("failed", "audited"),
+            ("down", "dead"),
+            ("skipped", "Auto"),
+            ("skipped", "daniel"),
+        ],
+        "{text}"
+    );
+
+    // JSON keeps the group's order.
+    let answer = json(&meow.run(&[&["--json"], &args[..]].concat()).await);
+    assert_eq!(answer["server"], format!("127.0.0.1:{}", daniel.port()));
+    let verdicts: Vec<(&str, &str)> = answer["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["name"].as_str().unwrap(), m["verdict"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            ("dead", "down"),
+            ("audited", "failed"),
+            ("Auto", "skipped"),
+            ("daniel", "skipped"),
+            ("clean", "reached"),
+        ]
+    );
+    let audited = &answer["members"][1];
+    assert!(audited["member-delay"].as_u64().unwrap() > 0, "{answer}");
+    assert!(audited["reason"].is_string(), "{answer}");
+
+    // Nothing was recorded.
+    let clean = json(&meow.run(&["--json", "proxy", "show", "clean"]).await);
+    assert_eq!(clean["history"], serde_json::json!([]), "{clean}");
+
+    let stderr = meow.fails(&["chain-health", "third-fast", "clean"]).await;
+    assert!(stderr.contains("'third-fast' is a group"), "{stderr}");
+    let stderr = meow.fails(&["chain-health", "nope", "clean"]).await;
+    assert!(stderr.contains("no proxy named 'nope'"), "{stderr}");
 }

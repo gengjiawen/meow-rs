@@ -2784,10 +2784,15 @@ mod delay_support {
         /// response returns the given status code. Exercises the
         /// `expected`-param path and the status-line parsing path.
         InstantStatus(u16, &'static str),
+        /// Dials to the port fail as refused; the rest succeed instantly.
+        RefusesPort(u16),
     }
 
     pub struct TestAdapter {
         name: String,
+        addr: String,
+        /// `connect_over` passes the stream through rather than refusing.
+        relays: bool,
         health: ProxyHealth,
         behavior: DialBehavior,
         pub dial_starts: Arc<Mutex<Vec<Instant>>>,
@@ -2797,10 +2802,26 @@ mod delay_support {
         pub fn new(name: &str, behavior: DialBehavior) -> Self {
             Self {
                 name: name.to_string(),
+                addr: String::new(),
+                relays: false,
                 health: ProxyHealth::new(),
                 behavior,
                 dial_starts: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// A proxy with a server at `addr`, rather than a DIRECT-like hop a
+        /// relay passes through.
+        pub fn at(mut self, addr: &str) -> Self {
+            self.addr = addr.to_string();
+            self
+        }
+
+        /// One that also runs over another proxy's stream, as a chained
+        /// outbound does.
+        pub fn relaying(mut self) -> Self {
+            self.relays = true;
+            self
         }
 
         pub fn into_proxy(self) -> Arc<dyn Proxy> {
@@ -2896,18 +2917,27 @@ mod delay_support {
             &self.name
         }
         fn adapter_type(&self) -> AdapterType {
-            AdapterType::Direct
+            if self.addr.is_empty() {
+                AdapterType::Direct
+            } else {
+                AdapterType::Http
+            }
         }
         fn addr(&self) -> &str {
-            ""
+            &self.addr
         }
         fn support_udp(&self) -> bool {
             false
         }
-        async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
             self.dial_starts.lock().unwrap().push(Instant::now());
             match &self.behavior {
-                DialBehavior::InstantOk => Ok(Box::new(CannedConn::ok())),
+                DialBehavior::RefusesPort(port) if metadata.dst_port == *port => {
+                    Err(MeowError::Proxy("connection refused".into()))
+                }
+                DialBehavior::InstantOk | DialBehavior::RefusesPort(_) => {
+                    Ok(Box::new(CannedConn::ok()))
+                }
                 DialBehavior::SleepThenOk(d) => {
                     tokio::time::sleep(*d).await;
                     Ok(Box::new(CannedConn::ok()))
@@ -2924,6 +2954,19 @@ mod delay_support {
         }
         async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
             Ok(Box::new(NopPacketConn))
+        }
+        async fn connect_over(
+            &self,
+            stream: Box<dyn ProxyConn>,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn ProxyConn>> {
+            if !self.relays {
+                return Err(MeowError::NotSupported(format!(
+                    "{}: connect_over not supported",
+                    self.name
+                )));
+            }
+            Ok(stream)
         }
         fn health(&self) -> &ProxyHealth {
             &self.health
@@ -2955,6 +2998,13 @@ mod delay_support {
         }
         async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
             self.inner.dial_udp(metadata).await
+        }
+        async fn connect_over(
+            &self,
+            stream: Box<dyn ProxyConn>,
+            metadata: &Metadata,
+        ) -> Result<Box<dyn ProxyConn>> {
+            self.inner.connect_over(stream, metadata).await
         }
         fn health(&self) -> &ProxyHealth {
             self.inner.health()
@@ -3986,6 +4036,203 @@ async fn h6_sleep_then_transport_error_is_503() {
         &bytes[..],
         br#"{"message":"An error occurred in the delay test"}"#
     );
+}
+
+// ── Chain health: GET /proxies/{name}/chain-health ───────────────────
+
+struct ChainHealthFixture {
+    state: Arc<AppState>,
+    /// The proxies a check dials.
+    probed: Vec<Arc<dyn Proxy>>,
+    front: Arc<dyn Proxy>,
+}
+
+/// `daniel`, a chained outbound at `snell.example.com:8443`, and the front
+/// group `third-fast`: `HK` carries it, `SG` refuses its port, `JP` is
+/// down, `Auto` is a group, and `daniel` is a member too.
+fn chain_health_fixture() -> ChainHealthFixture {
+    let daniel = TestAdapter::new("daniel", DialBehavior::InstantOk)
+        .at("snell.example.com:8443")
+        .relaying()
+        .into_proxy();
+    let hk = TestAdapter::new("HK", DialBehavior::InstantOk)
+        .at("10.0.0.1:443")
+        .into_proxy();
+    let sg = TestAdapter::new("SG", DialBehavior::RefusesPort(8443))
+        .at("10.0.0.2:443")
+        .into_proxy();
+    let jp = TestAdapter::new("JP", DialBehavior::ImmediateError)
+        .at("10.0.0.3:443")
+        .into_proxy();
+    let auto = url_test_group("Auto", vec![Arc::clone(&hk)]);
+    let hy2 = TestAdapter::new("hy2", DialBehavior::InstantOk)
+        .at("hy2.example.com:8443")
+        .into_proxy();
+    let direct = TestAdapter::new("direct", DialBehavior::InstantOk).into_proxy();
+    let front = fallback_group(
+        "third-fast",
+        vec![
+            Arc::clone(&hk),
+            Arc::clone(&sg),
+            Arc::clone(&jp),
+            Arc::clone(&auto),
+            Arc::clone(&daniel),
+        ],
+    );
+    let probed = vec![Arc::clone(&daniel), Arc::clone(&hk), Arc::clone(&sg)];
+    let state = state_with_proxies(vec![
+        ("daniel", daniel),
+        ("HK", hk),
+        ("SG", sg),
+        ("JP", jp),
+        ("Auto", auto),
+        ("hy2", hy2),
+        ("direct", direct),
+        ("third-fast", Arc::clone(&front)),
+    ]);
+    ChainHealthFixture {
+        state,
+        probed,
+        front,
+    }
+}
+
+fn chain_health_path(name: &str, dialer: &str) -> String {
+    format!(
+        "/proxies/{name}/chain-health?dialer={dialer}&url={}&timeout=1000",
+        url_q()
+    )
+}
+
+/// Each member of the front group gets a verdict, in the group's order,
+/// and nothing is recorded: no delay, no chain verdict.
+#[tokio::test]
+async fn chain_health_gives_each_member_a_verdict() {
+    let ChainHealthFixture {
+        state,
+        probed,
+        front,
+    } = chain_health_fixture();
+    let app = create_router(Arc::clone(&state));
+    let resp = delay_req(app, chain_health_path("daniel", "third-fast")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = body_json(resp).await;
+    // Delays vary; each that is there must be positive.
+    for member in body["members"].as_array_mut().unwrap() {
+        for key in ["delay", "member-delay"] {
+            if let Some(delay) = member.get_mut(key) {
+                assert!(delay.as_u64().unwrap() > 0, "{key}: {delay}");
+                *delay = serde_json::json!(1);
+            }
+        }
+    }
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "proxy": "daniel",
+            "server": "snell.example.com:8443",
+            "dialer": "third-fast",
+            "members": [
+                {"name": "HK", "verdict": "reached", "delay": 1, "member-delay": 1},
+                {"name": "SG", "verdict": "failed", "member-delay": 1,
+                 "reason": "connection refused"},
+                {"name": "JP", "verdict": "down", "reason": "connection failed"},
+                {"name": "Auto", "verdict": "skipped", "reason": "a group"},
+                {"name": "daniel", "verdict": "skipped", "reason": "the proxy itself"},
+            ],
+        })
+    );
+    for proxy in probed {
+        assert!(proxy.delay_history().is_empty(), "{}", proxy.name());
+    }
+    assert!(front.chain_health().unwrap().targets().is_empty());
+}
+
+/// A single proxy serves as the dialer too.
+#[tokio::test]
+async fn chain_health_takes_a_single_proxy_as_the_dialer() {
+    let state = chain_health_fixture().state;
+    let resp = delay_req(create_router(state), chain_health_path("daniel", "SG")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["dialer"], "SG");
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    // With no member reaching the server, SG's failure is not its own.
+    assert_eq!(members[0]["verdict"], "inconclusive");
+}
+
+#[tokio::test]
+async fn chain_health_refuses_what_it_cannot_probe() {
+    struct Case {
+        path: String,
+        status: StatusCode,
+        message: &'static str,
+    }
+    let case = |path: String, status, message| Case {
+        path,
+        status,
+        message,
+    };
+    let cases = [
+        case(
+            format!("/proxies/daniel/chain-health?url={}&timeout=1000", url_q()),
+            StatusCode::BAD_REQUEST,
+            "Body invalid",
+        ),
+        case(
+            "/proxies/daniel/chain-health?dialer=HK&timeout=1000".into(),
+            StatusCode::BAD_REQUEST,
+            "Body invalid",
+        ),
+        case(
+            chain_health_path("nope", "HK"),
+            StatusCode::NOT_FOUND,
+            "no proxy named 'nope'",
+        ),
+        case(
+            chain_health_path("daniel", "nope"),
+            StatusCode::NOT_FOUND,
+            "no proxy or group named 'nope'",
+        ),
+        case(
+            chain_health_path("third-fast", "HK"),
+            StatusCode::BAD_REQUEST,
+            "'third-fast' is a group; name one of its proxies",
+        ),
+        case(
+            chain_health_path("direct", "HK"),
+            StatusCode::BAD_REQUEST,
+            "'direct' has no server to dial through 'HK'",
+        ),
+        case(
+            chain_health_path("hy2", "HK"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "'hy2' cannot run over another proxy's stream, so it cannot be chained",
+        ),
+    ];
+    let state = chain_health_fixture().state;
+    let mut failures = Vec::new();
+    for case in cases {
+        let resp = delay_req(create_router(Arc::clone(&state)), case.path.clone()).await;
+        let status = resp.status();
+        let body = body_json(resp).await;
+        if status != case.status || body["message"] != case.message {
+            failures.push(format!("{}: {status} {body}", case.path));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn chain_health_needs_the_secret() {
+    let daniel = TestAdapter::new("daniel", DialBehavior::InstantOk)
+        .at("snell.example.com:8443")
+        .relaying()
+        .into_proxy();
+    let state = state_with_proxies_and_secret(vec![("daniel", daniel)], "hunter2");
+    let resp = delay_req(create_router(state), chain_health_path("daniel", "DIRECT")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── Connection management tests ──────────────────────────────────

@@ -43,6 +43,7 @@ static files instead.
 | `PUT` | `/proxies/{name}` | Select a member in a group — body `{ "name": "member" }` → 204 |
 | `GET` | `/proxies/{name}/delay` | Probe delay — query `url`, `timeout`, `expected`; also probes a provider node |
 | `GET` | `/group/{name}/delay` | Probe every member of a group — same query; `{ "member": delay }` for the members that passed within `timeout`, 504 when none did |
+| `GET` | `/proxies/{name}/chain-health` | Probe a proxy chained through each member of `dialer` (a group, or one proxy) — query `dialer`, `url`, `timeout`, `expected`; see [Chain health](#chain-health) |
 
 Every proxy object carries `provider-name`: the name of the proxy-provider
 that supplied the node, or `""` for `proxies:` entries, groups and the
@@ -57,6 +58,42 @@ node (mihomo returns 404 there). When a name is both a `proxies:` entry and
 a provider node, the `proxies:` entry wins; when two providers supply it,
 the first provider by name wins. `/providers/proxies/{provider}/{name}`
 reaches each of them.
+
+### Chain health
+
+`GET /proxies/{name}/chain-health?dialer=Airport&url=…&timeout=5000`
+dials proxy `name` through each member of `dialer`, the way `dialer-proxy`
+chains it, whether or not `name` sets one, and probes each member alone
+too, 16 members at a time. It records nothing: no delay, no chain verdict,
+no logbook entry. The answer keeps the group's order:
+
+```json
+{
+  "proxy": "home",
+  "server": "snell.example.com:8443",
+  "dialer": "Airport",
+  "members": [
+    { "name": "HK 01", "verdict": "reached", "delay": 182, "member-delay": 95 },
+    { "name": "SG 01", "verdict": "failed", "member-delay": 88, "reason": "closed before any reply" },
+    { "name": "JP 01", "verdict": "down", "reason": "timed out" },
+    { "name": "Auto", "verdict": "skipped", "reason": "a group" }
+  ]
+}
+```
+
+| Verdict | Meaning |
+| --- | --- |
+| `reached` | The chain through the member reached `url`: `delay`, and `member-delay` when the member alone did too |
+| `failed` | The member reached `url` alone and another member carried the chain, but this one did not: it blocks the proxy's server |
+| `inconclusive` | The member reached `url` alone but not through the chain, and no member carried it: the proxy's own server is the likelier fault |
+| `down` | The member failed alone too, so it says nothing about the chain |
+| `skipped` | Not probed: a group, or the proxy itself |
+
+`reason` is the failure: the chain's for `failed` and `inconclusive`, the
+member's own for `down`. 400 for a missing `dialer`, `url` or `timeout`, a
+group, or a proxy with no server (`DIRECT`); 404 for an unknown proxy or
+dialer; 422 for a proxy that cannot run over another proxy's stream, like
+hysteria2, found once a member reaches its server. TCP only.
 
 ## Rules
 

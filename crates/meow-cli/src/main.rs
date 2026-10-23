@@ -67,6 +67,18 @@ enum Command {
     /// Proxies, proxy-provider members included
     #[command(subcommand)]
     Proxy(ProxyCommand),
+    /// Whether each member of a group can carry a proxy as its
+    /// dialer-proxy: the chain through each member, and the member alone.
+    /// Records nothing
+    ChainHealth {
+        /// The chained proxy, dialled through each member whether or not
+        /// its config sets a dialer-proxy
+        proxy: String,
+        /// The group whose members to try, or a single proxy
+        dialer: String,
+        #[command(flatten)]
+        probe: Probe,
+    },
     /// Routing rules
     #[command(subcommand)]
     Rule(RuleCommand),
@@ -444,6 +456,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             ProxyCommand::Show { name } => proxies::proxy_show(&ctx, &name).await,
             ProxyCommand::Test { name, probe } => proxies::proxy_test(&ctx, &name, &probe).await,
         },
+        Command::ChainHealth {
+            proxy,
+            dialer,
+            probe,
+        } => proxies::chain_health(&ctx, &proxy, &dialer, &probe).await,
         Command::Rule(RuleCommand::List { filter }) => engine::rules(&ctx, filter.as_deref()).await,
         Command::Conn(command) => match command {
             ConnCommand::List { filter } => connections::list(&ctx, filter.as_deref()).await,

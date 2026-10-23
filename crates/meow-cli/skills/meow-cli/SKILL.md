@@ -130,6 +130,32 @@ meow-cli logbook --subject airport   # one provider, group or listener
 meow-cli logbook --before 812        # older entries; a full page prints this line
 ```
 
+### Checking a dialer-proxy chain
+
+`chain-health` dials a proxy through each member of a group, the way
+`dialer-proxy` chains it, whether or not its config sets one, and tests each
+member alone too. It records nothing: no delay, no verdict, no switch. Each
+member gets one verdict:
+
+- `reached`: the chain works through it; CHAIN is the chain's delay.
+- `failed`: the member works alone, and other members carry the proxy, but
+  this one does not: it blocks the proxy's server. Keep it out of the
+  proxy's dialer group.
+- `inconclusive`: it works alone, but no member carried the proxy: the
+  proxy's own server is the likelier fault.
+- `down`: it fails alone too, so it says nothing about the chain.
+- `skipped`: a group, or the proxy itself.
+
+```bash
+meow-cli chain-health home Auto      # can each member of Auto carry home?
+meow-cli chain-health home "HK 01"   # one front proxy
+meow-cli chain-health home Auto --url https://cp.cloudflare.com --probe-timeout 3000
+meow-cli --json chain-health home Auto
+```
+
+A proxy that cannot run over another proxy's stream, like hysteria2, is
+refused (422). The check is TCP only.
+
 ## Changing state
 
 These change how meow routes or what it keeps. Tell the user what you are

@@ -87,6 +87,7 @@ older unit for meow to publish there.
 | `group unfix G` | Return a url-test or fallback group to its automatic choice |
 | `group test G` | Delay-test every member of a group |
 | `proxy list` / `show P` / `test P` | Proxies, provider members included; one proxy's delay history; a delay test |
+| `chain-health P DIALER` | Which members of a group can carry a proxy as its `dialer-proxy`, see [below](#checking-a-dialer-proxy-chain) |
 | `rule list` | Rules in match order, with their index |
 | `conn list` / `show ID` | Open connections with the rule and route; one connection with its notes |
 | `conn close ID…` / `--all` | Close connections by id or unique id prefix, or all of them |
@@ -135,6 +136,34 @@ What a change does:
   provider without one.
 - `subscription list` shows only the scheme and host of each URL: the rest
   usually carries an access token.
+
+## Checking a dialer-proxy chain
+
+A node that works on its own can still refuse to carry another proxy: some
+airport nodes close every connection to a server they audit. `chain-health`
+dials a proxy through each member of a group, the way `dialer-proxy` chains
+it, whether or not the proxy's config sets one, and tests each member alone
+too. It records nothing, so the groups and the logbook stay as they were.
+
+```bash
+meow-cli chain-health home Airport
+```
+
+```text
+VERDICT  CHAIN   ALONE   REASON                   MEMBER
+reached  182 ms  95 ms   -                        HK 01
+failed   failed  88 ms   closed before any reply  SG 01
+down     failed  failed  timed out                JP 01
+skipped  -       -       a group                  Auto
+```
+
+`failed` members work alone but cannot carry `home`: keep them out of its
+dialer group. When no member carries it, the members that work alone read
+`inconclusive` instead, as `home`'s own server is the likelier fault.
+`down` members fail alone too, and say nothing about the chain. A proxy
+that cannot run over another proxy's stream, like hysteria2, is refused.
+`--json` gives each member's verdict, delays and reason, in the group's
+order; see [the REST API](../reference/rest-api#chain-health).
 
 ## Scripting
 

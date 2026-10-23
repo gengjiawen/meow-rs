@@ -325,6 +325,108 @@ pub async fn proxy_test(ctx: &Ctx, name: &str, probe: &Probe) -> anyhow::Result<
     print(&format!("{delay} ms\n"))
 }
 
+/// `GET /proxies/{name}/chain-health`.
+#[derive(Deserialize)]
+struct ChainHealth {
+    server: String,
+    members: Vec<ChainMember>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ChainMember {
+    name: String,
+    verdict: String,
+    /// Through the chain.
+    delay: Option<u16>,
+    /// The member alone.
+    member_delay: Option<u16>,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Members meow probes at once in a chain-health check.
+const CHAIN_MEMBERS_AT_ONCE: usize = 16;
+
+pub async fn chain_health(
+    ctx: &Ctx,
+    name: &str,
+    dialer: &str,
+    probe: &Probe,
+) -> anyhow::Result<()> {
+    // Each batch of members takes up to the probe timeout. An unknown
+    // dialer counts as one: the check itself says what is wrong.
+    let members = match ctx
+        .client
+        .get(&format!("/proxies/{}", encode(dialer)))
+        .await
+    {
+        Ok(answer) => serde_json::from_value::<ProxyInfo>(answer)
+            .ok()
+            .and_then(|dialer| dialer.all)
+            .map_or(1, |all| all.len()),
+        Err(_) => 1,
+    };
+    let batches = u32::try_from(members.div_ceil(CHAIN_MEMBERS_AT_ONCE)).unwrap_or(u32::MAX);
+    let client = ctx.client.waiting_at_least(
+        Duration::from_millis(probe.probe_timeout.into()) * batches.saturating_add(1)
+            + Duration::from_secs(10),
+    );
+    let timeout = probe.probe_timeout.to_string();
+    let path = with_query(
+        &format!("/proxies/{}/chain-health", encode(name)),
+        &[
+            ("dialer", Some(dialer)),
+            ("url", Some(&probe.url)),
+            ("timeout", Some(&timeout)),
+        ],
+    );
+    let answer = client.get(&path).await?;
+    if ctx.json {
+        return print_json(&answer);
+    }
+    let health: ChainHealth = serde_json::from_value(answer)?;
+    let mut members = health.members;
+    let rank = |verdict: &str| {
+        ["reached", "failed", "inconclusive", "down", "skipped"]
+            .iter()
+            .position(|v| *v == verdict)
+            .unwrap_or(usize::MAX)
+    };
+    // Carriers fastest first, then the members that cannot carry the chain;
+    // the sort is stable, so the group's order holds within the rest.
+    members.sort_by_key(|m| (rank(&m.verdict), m.delay));
+    let ms = |delay: Option<u16>, probed: bool| match delay {
+        Some(delay) => format!("{delay} ms"),
+        None if probed => "failed".into(),
+        None => "-".into(),
+    };
+    let mut table = Table::new(&["VERDICT", "CHAIN", "ALONE", "REASON", "MEMBER"]);
+    for member in &members {
+        let probed = member.verdict != "skipped";
+        let reason = if member.reason.is_empty() {
+            "-"
+        } else {
+            &member.reason
+        };
+        table.row(vec![
+            member.verdict.clone(),
+            ms(member.delay, probed),
+            ms(member.member_delay, probed),
+            reason.to_string(),
+            member.name.clone(),
+        ]);
+    }
+    if members.iter().any(|m| m.verdict == "inconclusive") {
+        eprintln!(
+            "note: no member carried {name}, so the fault is likelier its own (its server \
+             {}, or its way to {}) than the members'",
+            health.server, probe.url
+        );
+    }
+    print(&table.render())
+}
+
 async fn group(ctx: &Ctx, name: &str) -> anyhow::Result<Value> {
     ctx.client.get(&format!("/group/{}", encode(name))).await
 }
