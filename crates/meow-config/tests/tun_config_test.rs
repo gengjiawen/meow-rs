@@ -24,6 +24,7 @@
 //! |     | (issue #543): respellings/ignored fields equal, real params not  |
 //! | T17 | `global_route_outbound_interface` (the pre-build binding gate,    |
 //! |     | issue #695) agrees with the parsed `TunConfig`                     |
+//! | T18 | unset `inet4-address` → the fake-IP range's first /30, like mihomo |
 
 use std::time::Duration;
 
@@ -45,7 +46,9 @@ async fn t1_no_tun_block_yields_default_disabled() {
         .expect("config must load");
     assert!(!cfg.tun.enable, "default tun must be disabled");
     assert_eq!(cfg.tun.mtu, 1500);
-    assert_eq!(cfg.tun.inet4_address.to_string(), "172.19.0.1/30");
+    // The default fake-IP range's first /30, which the pool never hands
+    // out, like mihomo.
+    assert_eq!(cfg.tun.inet4_address.to_string(), "198.18.0.1/30");
     assert!(cfg.tun.auto_route, "auto-route defaults on");
     assert!(!cfg.tun.dns_hijack, "dns-hijack defaults off");
     assert_eq!(
@@ -491,4 +494,75 @@ async fn t17_global_route_gate_matches_parsed_config() {
         Some(None),
         "no outbound-interface → auto-detect"
     );
+}
+
+// ─── T18: the default address follows the fake-IP range ──────────────────
+// A fixed private subnet (the old `172.19.0.1/30`) takes the gateway and
+// first containers of a Docker network on that subnet. The fake-IP range's
+// reserved first /30 is outside every LAN and container network.
+
+#[tokio::test]
+async fn t18_inet4_address_defaults_to_the_fake_ip_ranges_first_slash_30() {
+    let load = |dns: &'static str, tun: &'static str| async move {
+        let yaml = format!("dns:\n  enable: true\n{dns}tun:\n  enable: true\n{tun}");
+        load_config_from_str(&yaml)
+            .await
+            .expect("config must load")
+            .tun
+            .inet4_address
+            .to_string()
+    };
+
+    assert_eq!(
+        load("  enhanced-mode: fake-ip\n", "").await,
+        "198.18.0.1/30"
+    );
+    assert_eq!(
+        load(
+            "  enhanced-mode: fake-ip\n  fake-ip-range: 28.0.0.1/8\n",
+            ""
+        )
+        .await,
+        "28.0.0.1/30"
+    );
+    // The host is the pool's gateway however the range is written.
+    assert_eq!(
+        load(
+            "  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.0/15\n",
+            ""
+        )
+        .await,
+        "198.18.0.1/30"
+    );
+    // Like mihomo, the range sets it in every DNS mode.
+    assert_eq!(
+        load("  fake-ip-range: 28.0.0.1/8\n", "").await,
+        "28.0.0.1/30"
+    );
+    // An explicit address wins.
+    assert_eq!(
+        load(
+            "  enhanced-mode: fake-ip\n  fake-ip-range: 28.0.0.1/8\n",
+            "  inet4-address: 172.19.0.1/30\n"
+        )
+        .await,
+        "172.19.0.1/30"
+    );
+}
+
+#[test]
+fn t18b_unusable_fake_ip_ranges_fall_back_to_the_default_range() {
+    use meow_config::default_tun_inet4_address as default_for;
+
+    assert_eq!(default_for(None).to_string(), "198.18.0.1/30");
+    assert_eq!(default_for(Some("10.0.0.0/29")).to_string(), "10.0.0.1/30");
+    // Too small to hold the pool's reserved block and a fake IP, not
+    // IPv4, or not a CIDR.
+    for range in ["10.0.0.0/30", "fdfe:dcba:9876::/64", "not-a-cidr"] {
+        assert_eq!(
+            default_for(Some(range)).to_string(),
+            "198.18.0.1/30",
+            "{range}"
+        );
+    }
 }

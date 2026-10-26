@@ -190,6 +190,21 @@ the canonical, in-repo source a release is cut from.
   compatibility shims now normalize every pattern kind (`+.x`, padded or
   uppercase input) into the open domain arm where they used to
   literal-store it.
+- **The TUN device's default address is the fake-IP range's first /30**:
+  without `tun.inet4-address`, the device took `172.19.0.1/30`, inside
+  the private ranges Docker hands its networks. On a host with a Docker
+  network on `172.19.0.0/16` (often the second compose network), meow
+  took that network's gateway address and routed its first containers
+  into the TUN, so the host could no longer reach them. Like mihomo, the
+  default is now the first /30 of `dns.fake-ip-range`: `198.18.0.1/30`
+  for the default range, an address the fake-IP pool never hands out.
+  With `dns-hijack`, the resolver meow points the system at on Linux and
+  macOS moves from the fake-IP gateway to the next reserved address
+  (`198.18.0.2` by default) whenever the device itself holds the
+  gateway. An explicit `inet4-address` is used as before. For embedders,
+  `meow_config::parse_tun_config` takes the fake-IP range as a third
+  argument (`RawConfig::fake_ip_range`), and
+  `meow_config::default_tun_inet4_address` derives the default.
 
 ### Removed
 

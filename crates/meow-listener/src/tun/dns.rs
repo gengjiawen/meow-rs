@@ -1,9 +1,10 @@
 //! OS DNS resolver configuration for the TUN inbound.
 //!
 //! When `dns-hijack` is active, the OS resolver must be pointed at a
-//! DNS server that returns fake IPs.  On macOS/Linux this is the fake-IP
-//! gateway (e.g. `198.18.0.1`) — queries enter the TUN device and are
-//! answered by `dns-hijack`.  On Windows a local DNS server
+//! DNS server that returns fake IPs.  On macOS/Linux this is an address
+//! the fake-IP pool reserves ([`GuardAddrs`]; `198.18.0.2` by default) —
+//! queries enter the TUN device and are answered by `dns-hijack`.  On
+//! Windows a local DNS server
 //! (`tun/local_dns.rs`) is bound to `127.0.0.1:53` and `[::1]:53`, and
 //! the system DNS is set to those loopback addresses.
 //!
@@ -15,8 +16,36 @@
 //! does not abort the TUN listener startup, and a recovery failure is
 //! similarly non-fatal.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use tracing::{debug, warn};
+
+/// Where the guard points the OS resolver on macOS/Linux, and every
+/// address a run may have pointed it at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GuardAddrs {
+    /// The resolver address to install.
+    pub(super) dns: IpAddr,
+    /// The fake-IP pool's two reserved hosts. An unclean shutdown leaves
+    /// one of them as the active DNS — the gateway before the device took
+    /// it by default — and neither may ever be backed up as the user's.
+    pub(super) own: [IpAddr; 2],
+}
+
+impl GuardAddrs {
+    /// The fake-IP pool never hands out its range's first four addresses:
+    /// network, gateway and the two above. The resolver gets the gateway,
+    /// or the address above it when the device owns the gateway (its
+    /// default address): a query to the device's own address is local and
+    /// never enters the TUN.
+    pub(super) fn new(gateway: Ipv4Addr, device: Ipv4Addr) -> Self {
+        let spare = Ipv4Addr::from(u32::from(gateway).wrapping_add(1));
+        let dns = if device == gateway { spare } else { gateway };
+        Self {
+            dns: dns.into(),
+            own: [gateway.into(), spare.into()],
+        }
+    }
+}
 
 /// RAII guard that restores original DNS settings on drop.
 ///
@@ -34,17 +63,17 @@ pub(super) struct DnsGuard {
 }
 
 impl DnsGuard {
-    /// Save current DNS settings and set all interfaces to `dns_addr`.
+    /// Save current DNS settings and set all interfaces to `addrs.dns`.
     /// Returns `None` on platforms without a supported backend, or when
     /// the backup fails.
     ///
-    /// On Windows `dns_addr` is ignored — the system DNS is always set
+    /// On Windows `addrs` is ignored — the system DNS is always set
     /// to `127.0.0.1` (IPv4) and `::1` (IPv6) so queries reach the
     /// local DNS server (`tun/local_dns.rs`).
-    pub(super) fn setup(dns_addr: IpAddr) -> Option<Self> {
+    pub(super) fn setup(addrs: GuardAddrs) -> Option<Self> {
         #[cfg(target_os = "windows")]
         {
-            let _ = dns_addr;
+            let _ = (addrs.dns, addrs.own);
             match windows::backup() {
                 Ok(backup) => {
                     if let Err(e) = windows::set_all() {
@@ -62,7 +91,8 @@ impl DnsGuard {
         }
         #[cfg(target_os = "macos")]
         {
-            match macos::backup(dns_addr) {
+            let dns_addr = addrs.dns;
+            match macos::backup(&addrs.own) {
                 Ok(backup) => {
                     if let Err(e) = macos::set_all(dns_addr, &backup) {
                         warn!("tun dns-guard: failed to set DNS to {dns_addr}: {e}");
@@ -81,6 +111,7 @@ impl DnsGuard {
         }
         #[cfg(target_os = "linux")]
         {
+            let dns_addr = addrs.dns;
             match linux::backup_and_set(dns_addr) {
                 Ok(backup) => {
                     debug!("tun dns-guard: DNS set to {dns_addr} in /etc/resolv.conf");
@@ -96,7 +127,7 @@ impl DnsGuard {
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
-            let _ = dns_addr;
+            let _ = (addrs.dns, addrs.own);
             debug!("tun dns-guard: no DNS backend for this platform; skipping");
             None
         }
@@ -467,7 +498,7 @@ mod windows {
 // Only services that were snapshotted are ever changed: `set_all` and
 // `restore` both iterate the backup, so a service whose
 // `-getdnsservers` failed (or that appeared after the snapshot) is left
-// untouched rather than pointed at the fake-IP gateway with nothing to
+// untouched rather than pointed at the fake-IP range with nothing to
 // restore it from.
 // ---------------------------------------------------------------------------
 
@@ -478,11 +509,11 @@ mod macos {
     use std::net::IpAddr;
     use std::process::Command;
 
-    pub(super) fn backup(dns_addr: IpAddr) -> io::Result<Vec<(String, Vec<IpAddr>)>> {
+    pub(super) fn backup(own: &[IpAddr]) -> io::Result<Vec<(String, Vec<IpAddr>)>> {
         let services = list_services()?;
         let mut result = Vec::with_capacity(services.len());
         for svc in services {
-            match get_dns(&svc, dns_addr) {
+            match get_dns(&svc, own) {
                 Ok(servers) => {
                     super::debug!("tun dns-guard: '{svc}' DNS before setup: {servers:?}");
                     result.push((svc, servers));
@@ -532,7 +563,7 @@ mod macos {
         Ok(networksetup::parse_services(&stdout))
     }
 
-    fn get_dns(service: &str, own: IpAddr) -> io::Result<Vec<IpAddr>> {
+    fn get_dns(service: &str, own: &[IpAddr]) -> io::Result<Vec<IpAddr>> {
         let stdout = run(&["-getdnsservers", service])?;
         Ok(networksetup::saved_dns_servers(&stdout, own))
     }
@@ -638,14 +669,14 @@ mod networksetup {
     /// The list is exactly the lines that parse as an IP address, so the
     /// "There aren't any DNS Servers set on <svc>." sentence — in any
     /// wording — yields an empty list, restored as `Empty`. `own` (the
-    /// fake-IP gateway meow installs) is dropped too: after an unclean
-    /// shutdown it is still the active DNS, and keeping it would make a
-    /// later clean exit "restore" the broken state.
-    pub(super) fn saved_dns_servers(stdout: &str, own: IpAddr) -> Vec<IpAddr> {
+    /// addresses meow installs, [`super::GuardAddrs::own`]) is dropped
+    /// too: after an unclean shutdown one is still the active DNS, and
+    /// keeping it would make a later clean exit "restore" the broken state.
+    pub(super) fn saved_dns_servers(stdout: &str, own: &[IpAddr]) -> Vec<IpAddr> {
         stdout
             .lines()
             .filter_map(|l| l.trim().parse::<IpAddr>().ok())
-            .filter(|ip| *ip != own)
+            .filter(|ip| !own.contains(ip))
             .collect()
     }
 
@@ -664,8 +695,11 @@ mod networksetup {
         use super::*;
         use std::net::Ipv4Addr;
 
-        /// The default fake-IP gateway (`198.18.0.1`).
-        const OWN: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+        /// The default fake-IP pool's reserved hosts (`198.18.0.1`, `.2`).
+        const OWN: &[IpAddr] = &[
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2)),
+        ];
 
         /// networksetup's trailer on every parameter error.
         const PARAMS_INVALID: &str = "** Error: The parameters were not valid.";
@@ -720,6 +754,13 @@ mod networksetup {
             assert!(saved_dns_servers("198.18.0.1\n", OWN).is_empty());
             assert_eq!(
                 saved_dns_servers("198.18.0.1\n1.1.1.1\n", OWN),
+                ips(&["1.1.1.1"])
+            );
+            // The address above it, installed when the device owns the
+            // gateway, leaks the same way.
+            assert!(saved_dns_servers("198.18.0.2\n", OWN).is_empty());
+            assert_eq!(
+                saved_dns_servers("1.1.1.1\n198.18.0.2\n", OWN),
                 ips(&["1.1.1.1"])
             );
         }
@@ -896,5 +937,41 @@ mod linux {
         fs::write(&backup.path, &backup.content)?;
         let _ = fs::remove_file(SIDECAR);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod guard_addrs_tests {
+    use super::GuardAddrs;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn resolver_never_gets_the_device_address() {
+        let gateway = ip("198.18.0.1");
+        let spare = ip("198.18.0.2");
+        // The default device address is the gateway itself.
+        assert_eq!(GuardAddrs::new(gateway, gateway).dns, IpAddr::from(spare));
+        // A device on the spare (a Windows retry), or outside the range,
+        // leaves the gateway to the resolver.
+        assert_eq!(GuardAddrs::new(gateway, spare).dns, IpAddr::from(gateway));
+        assert_eq!(
+            GuardAddrs::new(gateway, ip("172.19.0.1")).dns,
+            IpAddr::from(gateway)
+        );
+    }
+
+    #[test]
+    fn both_reserved_hosts_are_own() {
+        let gateway = ip("28.0.0.1");
+        for device in [gateway, ip("28.0.0.2"), ip("172.19.0.1")] {
+            assert_eq!(
+                GuardAddrs::new(gateway, device).own,
+                [IpAddr::from(gateway), IpAddr::from(ip("28.0.0.2"))]
+            );
+        }
     }
 }

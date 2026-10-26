@@ -1708,8 +1708,12 @@ async fn publish_tun_if_committed(
     let still_current = {
         let committed = raw_config.read();
         committed.tun.as_ref().is_some_and(|t| t.enable)
-            && meow_config::parse_tun_config(committed.tun.as_ref(), committed.max_connections)
-                .is_ok_and(|c| c == *startup_tun)
+            && meow_config::parse_tun_config(
+                committed.tun.as_ref(),
+                committed.max_connections,
+                committed.fake_ip_range(),
+            )
+            .is_ok_and(|c| c == *startup_tun)
     };
     if !still_current {
         warn!(
@@ -1946,7 +1950,12 @@ mod tests {
 
         fn startup_tun(raw: &RwLock<RawConfig>) -> meow_config::TunConfig {
             let guard = raw.read();
-            meow_config::parse_tun_config(guard.tun.as_ref(), guard.max_connections).unwrap()
+            meow_config::parse_tun_config(
+                guard.tun.as_ref(),
+                guard.max_connections,
+                guard.fake_ip_range(),
+            )
+            .unwrap()
         }
 
         /// A pending listener task plus a drop signal proving teardown.

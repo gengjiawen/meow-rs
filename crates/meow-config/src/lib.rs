@@ -284,7 +284,8 @@ pub struct TunConfig {
     /// Device name; `None` = platform default.
     pub device: Option<String>,
     pub mtu: u16,
-    /// Address + prefix assigned to the device.
+    /// Address + prefix assigned to the device. Defaults to the fake-IP
+    /// range's first /30 ([`default_tun_inet4_address`]).
     pub inet4_address: ipnet::Ipv4Net,
     /// IPv6 address + prefix assigned to the device (`inet6-address`).
     /// Only ever `Some` in global route mode, where it also adds the IPv6
@@ -327,8 +328,7 @@ impl Default for TunConfig {
             enable: false,
             device: None,
             mtu: 1500,
-            // mihomo's default TUN subnet.
-            inet4_address: "172.19.0.1/30".parse().expect("static CIDR parses"),
+            inet4_address: default_tun_inet4_address(None),
             inet6_address: None,
             auto_route: true,
             route_mode: TunRouteMode::FakeIp,
@@ -344,11 +344,38 @@ impl Default for TunConfig {
 /// smaller values break v6 traffic through the userspace stack.
 const TUN_MIN_MTU: u16 = 1280;
 
+/// The TUN device's address when `tun.inet4-address` is unset: the first
+/// /30 of `fake_ip_range` (`dns.fake-ip-range`), its gateway as the host,
+/// like mihomo. The fake-IP pool never hands out a range's first four
+/// addresses, so the device cannot take a fake IP; and the default range,
+/// 198.18.0.0/16, is outside every LAN and container network. A fixed
+/// private subnet is not: `172.19.0.1/30`, the old default, took the
+/// gateway and first containers of a Docker network on 172.19.0.0/16.
+/// A range that is not IPv4, or too small for the pool, falls back to
+/// the default range's /30.
+pub fn default_tun_inet4_address(fake_ip_range: Option<&str>) -> ipnet::Ipv4Net {
+    let from_range = |range: &str| {
+        let range = range.parse::<ipnet::Ipv4Net>().ok()?;
+        // The pool's first allocatable address is network + 4.
+        if range.prefix_len() > 29 {
+            return None;
+        }
+        let gateway = std::net::Ipv4Addr::from(u32::from(range.network()) + 1);
+        ipnet::Ipv4Net::new(gateway, 30).ok()
+    };
+    fake_ip_range
+        .and_then(from_range)
+        .or_else(|| from_range(dns_parser::DEFAULT_FAKE_IP_RANGE_V4))
+        .expect("the default fake-IP range is an IPv4 /16")
+}
+
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
-/// (disabled) when the block is absent.
+/// (disabled) when the block is absent. `fake_ip_range` is the config's
+/// `dns.fake-ip-range`, which sets the default `inet4-address`.
 pub fn parse_tun_config(
     raw: Option<&raw::RawTun>,
     global_max_connections: Option<usize>,
+    fake_ip_range: Option<&str>,
 ) -> Result<TunConfig, anyhow::Error> {
     let Some(r) = raw else {
         // Keep the global-cap folding symmetric with the `Some` arm: an
@@ -356,6 +383,7 @@ pub fn parse_tun_config(
         // diffing parsed configs see the same value either way.
         return Ok(TunConfig {
             max_connections: global_max_connections.unwrap_or(256),
+            inet4_address: default_tun_inet4_address(fake_ip_range),
             ..TunConfig::default()
         });
     };
@@ -395,7 +423,7 @@ pub fn parse_tun_config(
         Some(s) => s
             .parse::<ipnet::Ipv4Net>()
             .map_err(|e| anyhow::anyhow!("tun.inet4-address: invalid CIDR '{s}': {e}"))?,
-        None => defaults.inet4_address,
+        None => default_tun_inet4_address(fake_ip_range),
     };
 
     // v1 hijacks all UDP :53 flows when any usable entry is present.
@@ -4317,7 +4345,7 @@ pub async fn build_config(
     };
 
     // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections)?;
+    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
 
     // API config
     let external_ui = raw
@@ -7059,7 +7087,7 @@ rules:
             udp_timeout: Some(u64::MAX),
             ..raw::RawTun::default()
         };
-        let err = parse_tun_config(Some(&tun), None)
+        let err = parse_tun_config(Some(&tun), None, None)
             .expect_err("absurd tun.udp-timeout must be rejected");
         assert!(err.to_string().contains("udp-timeout"), "unexpected: {err}");
 

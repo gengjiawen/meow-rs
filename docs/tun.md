@@ -274,7 +274,7 @@ Scope and caveats:
   device and with it the device address and every route through it — no
   `/1` route is left and IP connectivity is back at once — but the
   `dns-hijack` resolver redirect survives: `/etc/resolv.conf` still names
-  the fake-ip gateway, so name resolution fails until meow starts again
+  an address in the fake-ip range, so name resolution fails until meow starts again
   (it recovers the original from `/etc/resolv.conf.meow-backup`) or you
   restore that file by hand.
 
@@ -371,7 +371,7 @@ checked against meow's log and `tcpdump` on both `en0` and the `utun`:
 - SIGTERM removes every route, the device and the DNS override. After
   `kill -9` the kernel destroys the `utun` and its routes with the
   process, so connectivity returns on its own — but with `dns-hijack`
-  the system DNS servers stay pointed at the fake-ip gateway and name
+  the system DNS servers stay pointed at the fake-ip range and name
   resolution is broken until meow is started and stopped cleanly once
   (or `networksetup -setdnsservers <service> empty`).
 
@@ -425,7 +425,7 @@ Get-NetRoute -DestinationPrefix 0.0.0.0/1, 128.0.0.0/1   # after stopping meow: 
 | `enable` | `false` | Master switch. Requires a build with the `listener-tun` feature (included in `full`). |
 | `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. On Windows a same-named leftover adapter is reopened — or recreated, when the driver has orphaned it — and reconfigured either way (see *Windows: address setup, adapter reuse, and conflicts*). |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
-| `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
+| `inet4-address` | first /30 of `dns.fake-ip-range` (`198.18.0.1/30`) | CIDR assigned to the device. Like mihomo, the default takes an address the fake-IP pool never hands out, outside LAN and Docker networks. A fixed private subnet can collide with one: a device on a Docker network's gateway address cuts the host off from that network's containers. |
 | `inet6-address` | none | IPv6 CIDR assigned to the device, e.g. `fdfe:dcba:9876::1/126` — a string, or mihomo's list form (only the first entry is used). Only honoured with `auto-route: global`, where it also adds the IPv6 split default routes (experimental, see above); ignored with a warning otherwise. An invalid CIDR is a hard error. |
 | `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4, plus all IPv6 with `inet6-address` (experimental, see above); `false` = nothing. |
 | `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode — the interface name on Linux/macOS (`eth0`, `en0`), the interface alias on Windows (`Ethernet`). Ignored otherwise. |

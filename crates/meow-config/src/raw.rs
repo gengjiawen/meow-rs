@@ -278,6 +278,14 @@ pub struct RawConfig {
     pub udp_timeout: Option<serde_json::Value>,
 }
 
+impl RawConfig {
+    /// `dns.fake-ip-range`, which also sets the TUN device's default
+    /// address ([`crate::parse_tun_config`]).
+    pub fn fake_ip_range(&self) -> Option<&str> {
+        self.dns.as_ref()?.fake_ip_range.as_deref()
+    }
+}
+
 /// A `hosts:` map value: one IP/domain alias or a list of IP addresses.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
@@ -319,7 +327,8 @@ pub struct RawTun {
     /// Device MTU. Default 1500; hard parse error below 1280 (the
     /// userspace stack's minimum, RFC 8200 §5).
     pub mtu: Option<u16>,
-    /// CIDR assigned to the device, e.g. `172.19.0.1/30` (default).
+    /// CIDR assigned to the device. Default: the first /30 of
+    /// `dns.fake-ip-range` (`198.18.0.1/30`), like mihomo.
     pub inet4_address: Option<String>,
     /// Route installation on startup. Accepts the mihomo boolean
     /// (`true` = fake-IP scope, `false` = off) plus the #375 mode strings

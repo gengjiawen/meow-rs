@@ -6358,6 +6358,59 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
     );
 }
 
+/// Without `inet4-address` the device address derives from
+/// `dns.fake-ip-range`, so a reload that changes only the range is a real
+/// parameter change even when no fake-IP pool runs (none here: DNS is
+/// off), which leaves the resolver-side restart trigger quiet.
+#[cfg(not(feature = "listener-tun"))]
+#[tokio::test]
+async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "dns:\n",
+        "  enable: false\n",
+        "  fake-ip-range: 28.0.0.1/8\n",
+        "tun:\n",
+        "  enable: true\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the device address moved from 198.18.0.1/30 to 28.0.0.1/30: the \
+         listener must restart"
+    );
+    // The restart's spawn fails without the feature and rolls back.
+    assert!(state
+        .raw_config
+        .read()
+        .tun
+        .as_ref()
+        .is_some_and(|t| !t.enable));
+}
+
 /// A `tun:` section the listener cannot parse is rejected at admission —
 /// committing it would let the reconcile restart tear down a healthy
 /// listener before the spawn-side parse fails (issue #543 review).

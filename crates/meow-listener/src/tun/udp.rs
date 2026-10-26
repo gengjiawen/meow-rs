@@ -476,7 +476,7 @@ pub(super) struct TunNets {
 /// destination re-enters the device and spawns a fresh flow from a new
 /// source port each round: an amplification loop. Windows NetBIOS
 /// name-service broadcasts to the subnet broadcast address (e.g.
-/// `172.19.0.3:137` for the default `172.19.0.1/30`) trigger exactly this,
+/// `198.18.0.3:137` for the default `198.18.0.1/30`) trigger exactly this,
 /// exhausting ephemeral ports within seconds of TUN start.
 pub(super) fn is_looping_dst(dst: std::net::IpAddr, tun_net: TunNets) -> bool {
     match dst {

@@ -18,7 +18,7 @@ use tracing::warn;
 
 /// Upstream Go mihomo default for v4 fake-IP CIDR. Used when
 /// `enhanced-mode: fake-ip` is set but `fake-ip-range` is omitted.
-const DEFAULT_FAKE_IP_RANGE_V4: &str = "198.18.0.1/16";
+pub(crate) const DEFAULT_FAKE_IP_RANGE_V4: &str = "198.18.0.1/16";
 
 /// `prior` is the resolver generation being replaced (config reload); its
 /// fake-IP pool is carried over when the configured range and store

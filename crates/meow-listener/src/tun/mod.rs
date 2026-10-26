@@ -68,7 +68,7 @@ mod windows_device;
 mod wintun;
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -424,6 +424,10 @@ impl TunListener {
         const TUN_CREATE_RETRY_DELAY: Duration = Duration::from_millis(500);
         let base_addr = cfg.inet4_address.addr();
         let prefix = cfg.inet4_address.prefix_len();
+        let fake_ip_gateway = match self.tunnel.resolver().fake_ip_v4_gateway() {
+            Some(std::net::IpAddr::V4(gateway)) => Some(gateway),
+            _ => None,
+        };
         let mut device: Option<tun_rs::AsyncDevice> = None;
         let mut dev_name = String::new();
         let mut used_addr = base_addr;
@@ -439,15 +443,9 @@ impl TunListener {
 
             // Rotate the addresses after the first retry fails
             // (attempt >= 2), so a conflict with an address another
-            // adapter still holds is worked around.  Each /30 subnet
-            // spans 4 addresses, so the IPv4 one steps to the next
-            // subnet; the IPv6 one steps within the configured subnet.
-            let addr = if attempt >= 2 {
-                let offset = (attempt - 1) * 4;
-                std::net::Ipv4Addr::from(u32::from(base_addr).wrapping_add(offset))
-            } else {
-                base_addr
-            };
+            // adapter still holds is worked around (`rotate_v4`); the
+            // IPv6 one steps within the configured subnet.
+            let addr = rotate_v4(base_addr, attempt, fake_ip_gateway);
             let ip_display = format!("{addr}/{prefix}");
 
             // Copy the values we need inside `spawn_blocking` so we don't
@@ -680,9 +678,10 @@ impl TunListener {
         // startup.
         let _dns_guard = if cfg.dns_hijack && cfg.auto_route {
             let t_dns = Instant::now();
-            let guard = match self.tunnel.resolver().fake_ip_v4_gateway() {
+            let guard = match fake_ip_gateway {
                 Some(gateway) => {
-                    let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(gateway))
+                    let addrs = dns::GuardAddrs::new(gateway, used_addr);
+                    let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(addrs))
                         .await
                         .map_err(|join_err| {
                             Box::new(io::Error::other(format!(
@@ -1020,6 +1019,29 @@ fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<Str
     }
 }
 
+/// The IPv4 address for `attempt`: the configured one for the first two,
+/// then another, so a conflict with an address another adapter still holds
+/// is worked around. An address in the fake-IP pool's reserved block
+/// (network, gateway and the two above; the default device address is the
+/// gateway) moves to the block's other host: the next /30 holds fake IPs
+/// the pool hands out, and a device owning one would make it local.
+/// Elsewhere each /30 subnet spans 4 addresses, so it steps to the next.
+fn rotate_v4(base: Ipv4Addr, attempt: u32, fake_ip_gateway: Option<Ipv4Addr>) -> Ipv4Addr {
+    if attempt < 2 {
+        return base;
+    }
+    if let Some(gateway) = fake_ip_gateway {
+        let spare = Ipv4Addr::from(u32::from(gateway).wrapping_add(1));
+        if base == gateway {
+            return spare;
+        }
+        if base == spare {
+            return gateway;
+        }
+    }
+    Ipv4Addr::from(u32::from(base).wrapping_add((attempt - 1) * 4))
+}
+
 /// The configured IPv6 net for `attempt`: from the third attempt the host
 /// bits step by one address, wrapping inside the subnet, so a conflict
 /// with an address another adapter still holds is worked around like the
@@ -1221,8 +1243,9 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S
 #[cfg(test)]
 mod tests {
     use super::{
-        device_name_for_attempt, global_route_nets, global_route_nets_for, rotate_v6,
-        sniff_first_payload, sniff_first_payload_within, Ipv6Net, TunTcpConn, TUN_SNIFF_WINDOW,
+        device_name_for_attempt, global_route_nets, global_route_nets_for, rotate_v4, rotate_v6,
+        sniff_first_payload, sniff_first_payload_within, Ipv4Addr, Ipv6Net, TunTcpConn,
+        TUN_SNIFF_WINDOW,
     };
     use std::io;
     use std::pin::Pin;
@@ -1261,6 +1284,33 @@ mod tests {
             device_name_for_attempt(Some("mytun"), 1),
             Some("mytun-1".to_string())
         );
+    }
+
+    #[test]
+    fn ipv4_address_steps_to_the_next_subnet_from_the_third_attempt() {
+        let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };
+        let base = ip("172.19.0.1");
+        let gateway = Some(ip("198.18.0.1"));
+        assert_eq!(rotate_v4(base, 0, gateway), base);
+        assert_eq!(rotate_v4(base, 1, gateway), base);
+        assert_eq!(rotate_v4(base, 2, gateway), ip("172.19.0.5"));
+        assert_eq!(rotate_v4(base, 3, gateway), ip("172.19.0.9"));
+        // Without a fake-IP pool even the gateway's address steps on.
+        assert_eq!(rotate_v4(ip("198.18.0.1"), 2, None), ip("198.18.0.5"));
+    }
+
+    #[test]
+    fn ipv4_address_stays_in_the_fake_ip_reserved_block() {
+        let ip = |s: &str| -> Ipv4Addr { s.parse().unwrap() };
+        let gateway = ip("198.18.0.1");
+        let spare = ip("198.18.0.2");
+        // 198.18.0.5 is a fake IP the pool hands out: the device on the
+        // gateway (the default) moves to the block's other host instead.
+        assert_eq!(rotate_v4(gateway, 1, Some(gateway)), gateway);
+        for attempt in 2..5 {
+            assert_eq!(rotate_v4(gateway, attempt, Some(gateway)), spare);
+            assert_eq!(rotate_v4(spare, attempt, Some(gateway)), gateway);
+        }
     }
 
     #[test]
