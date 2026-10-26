@@ -2068,9 +2068,11 @@ impl Resolver {
         self.fakeip_v4.as_ref().map(|p| p.ipnet())
     }
 
-    /// The v4 fake-IP pool gateway (network + 1, e.g. `198.18.0.1`). When
-    /// `dns-hijack` is active, the OS resolver should be pointed here so
-    /// that DNS queries enter the TUN and are answered with fake IPs.
+    /// The v4 fake-IP pool gateway (network + 1, e.g. `198.18.0.1`), which
+    /// the pool never hands out. The TUN device takes it by default; with
+    /// `dns-hijack` the OS resolver is pointed at it, or at the reserved
+    /// address above it when the device holds it, so that DNS queries
+    /// enter the TUN and are answered with fake IPs.
     pub fn fake_ip_v4_gateway(&self) -> Option<std::net::IpAddr> {
         self.fakeip_v4.as_ref().map(|p| p.gateway())
     }

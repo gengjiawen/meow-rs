@@ -604,9 +604,10 @@ mod tests {
         }
     }
 
+    /// The default device subnet: the fake-IP pool's reserved first /30.
     fn net() -> TunNets {
         TunNets {
-            v4: "172.19.0.1/30".parse().unwrap(),
+            v4: "198.18.0.1/30".parse().unwrap(),
             v6: None,
         }
     }
@@ -625,10 +626,12 @@ mod tests {
     #[test]
     fn drops_tun_subnet_broadcast_and_multicast() {
         // The NetBIOS storm case: subnet broadcast of the /30.
-        assert!(is_looping_dst(ip("172.19.0.3"), net()));
-        // The device's own address and anything else on-link.
-        assert!(is_looping_dst(ip("172.19.0.1"), net()));
-        assert!(is_looping_dst(ip("172.19.0.2"), net()));
+        assert!(is_looping_dst(ip("198.18.0.3"), net()));
+        // The device's own address and anything else on-link. The DNS
+        // guard's resolver, `198.18.0.2`, is one: dns-hijack answers its
+        // :53 flows before this check.
+        assert!(is_looping_dst(ip("198.18.0.1"), net()));
+        assert!(is_looping_dst(ip("198.18.0.2"), net()));
         // Limited broadcast and multicast (mDNS/SSDP/LLMNR).
         assert!(is_looping_dst(ip("255.255.255.255"), net()));
         assert!(is_looping_dst(ip("224.0.0.251"), net()));
@@ -636,18 +639,18 @@ mod tests {
         // The IPv6 device subnet, when the device carries one (#375).
         assert!(is_looping_dst(ip("fdfe:dcba:9876::1"), dual_net()));
         assert!(is_looping_dst(ip("fdfe:dcba:9876::3"), dual_net()));
-        assert!(is_looping_dst(ip("172.19.0.3"), dual_net()));
+        assert!(is_looping_dst(ip("198.18.0.3"), dual_net()));
     }
 
     #[test]
     fn keeps_routable_destinations() {
-        // Fake-IP range traffic — the whole point of the TUN.
+        // Fake-IP range traffic — the whole point of the TUN — from the
+        // first address the pool hands out, just outside the /30.
+        assert!(!is_looping_dst(ip("198.18.0.4"), net()));
         assert!(!is_looping_dst(ip("198.18.0.5"), net()));
         // Ordinary unicast, v4 and v6.
         assert!(!is_looping_dst(ip("8.8.8.8"), net()));
         assert!(!is_looping_dst(ip("2001:db8::1"), net()));
-        // Just outside the /30.
-        assert!(!is_looping_dst(ip("172.19.0.4"), net()));
         // An IPv4-only device has no IPv6 subnet to guard; a dual-stack one
         // guards exactly its /126.
         assert!(!is_looping_dst(ip("fdfe:dcba:9876::1"), net()));

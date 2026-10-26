@@ -766,8 +766,11 @@ impl TunListener {
             });
         }
 
+        // The subnet of the address the device took: a retry can step
+        // off the configured one (`rotate_v4`). The IPv6 one stays inside
+        // the configured subnet (`rotate_v6`).
         let tun_net = udp::TunNets {
-            v4: cfg.inet4_address,
+            v4: Ipv4Net::new_assert(used_addr, prefix),
             v6: cfg.inet6_address,
         };
         // Nothing past here fails: the listener is up, and its binding is
